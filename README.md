@@ -1,10 +1,13 @@
 # Amrita Engines
 
-Core engine interfaces and types for the Amrita framework.
+Core engine interfaces, types, and entity workflows for the Amrita framework.
 
 ## Overview
 
-This package provides the foundational engine interfaces and types used throughout the Amrita framework. It defines the core abstractions for processing engines, protocol buffer types, and shared utilities.
+This package provides the foundational engine system for the Amrita framework, including:
+
+- **Engine Interfaces & Types**: Core abstractions for processing engines, protocol buffer types, and shared utilities
+- **Entity Workflows**: High-level workflow patterns and execution models for entity-based processing
 
 ## Installation
 
@@ -18,8 +21,10 @@ This package provides core interfaces and types that are implemented by other Am
 
 ## Package Structure
 
-- `pkg/` - Core Go packages with engine interfaces and types
-- `proto/` - Protocol buffer definitions
+- `pkg/engines/` - Core engine interfaces and types
+- `pkg/entityworkflows/` - Entity workflow patterns and execution models
+- `proto/engines/` - Engine protocol buffer definitions
+- `proto/entity/` - Entity workflow protocol buffer definitions  
 - `gen/` - Generated protobuf Go code
 
 ## Dependencies

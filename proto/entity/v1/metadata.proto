@@ -1,0 +1,24 @@
+syntax = "proto3";
+
+package entity.v1;
+
+option go_package = "entity-workflows/gen/entity/v1;entityv1";
+
+import "google/protobuf/timestamp.proto";
+import "buf/validate/validate.proto";
+
+// EntityMetadata provides common context and metadata for all entities
+message EntityMetadata {
+  string entity_id = 1 [(buf.validate.field).string.pattern = "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"]; // UUID v4 format
+  string org_id = 2 [(buf.validate.field).string.min_len = 1];        // Organization identifier
+  string team_id = 3;                                                 // Team within organization  
+  string user_id = 4 [(buf.validate.field).string.min_len = 1];       // Acting user
+  string environment = 5 [(buf.validate.field).string = {in: ["dev", "staging", "prod"]}]; // Environment
+  string tenant = 6 [(buf.validate.field).string.min_len = 1];        // Top-level tenant isolation
+  string entity_type = 7 [(buf.validate.field).string.min_len = 1];   // Protobuf full URL
+  string signal_type = 8 [(buf.validate.field).string.min_len = 1];   // Signal type name for searchability
+  int64 sequence_number = 9 [(buf.validate.field).int64.gte = 0];      // Monotonic sequence number for ordering
+  google.protobuf.Timestamp created_at = 10;                          // Entity creation timestamp
+  google.protobuf.Timestamp updated_at = 11;                          // Last update timestamp
+  google.protobuf.Timestamp timestamp = 12;                           // Current operation timestamp
+} 
