@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"reflect"
 
-	basev1 "github.com/user/engines/gen/engines/base/v1"
+	basev1 "github.com/bo-socayo/amrita-engines/gen/engines/base/v1"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
