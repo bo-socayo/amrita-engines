@@ -1,0 +1,109 @@
+syntax = "proto3";
+
+package engines.base.v1;
+
+option go_package = "github.com/amrita/core-engine/proto/engines/base/v1;basev1";
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/any.proto";
+import "buf/validate/validate.proto";
+import "engines/base/v1/base_engine_state.proto";
+
+// Event envelope for type-safe event handling
+// All fields except metadata are REQUIRED and must be set
+message EventEnvelope {
+    int64 sequence_number = 1 [(buf.validate.field).required = true, (buf.validate.field).int64.gt = 0];           // REQUIRED: Must be > 0, monotonically increasing
+    string event_id = 2 [(buf.validate.field).required = true, (buf.validate.field).string.min_len = 1];                 // REQUIRED: Must be non-empty, globally unique
+    google.protobuf.Timestamp timestamp = 3 [(buf.validate.field).required = true];  // REQUIRED: Must be valid timestamp
+    google.protobuf.Any data = 4 [(buf.validate.field).required = true];        // REQUIRED: Must contain the actual event data
+    google.protobuf.Any metadata = 5;    // OPTIONAL: Additional context metadata (strongly typed)
+}
+
+// REMOVED: Response wrapper types to make API idiomatic Go
+// Instead of returning (response, error) where error is always nil,
+// we now return (result, error) where error contains all failure information
+
+// Transaction preparation result for 2PC
+// This is still needed as it contains actual data, not just success/failure
+message PrepareResult {
+    PrepareStatus status = 1 [(buf.validate.field).required = true, (buf.validate.field).enum.defined_only = true];            // REQUIRED: Status of prepare operation
+    int64 transaction_id = 2 [(buf.validate.field).required = true];            // REQUIRED: Transaction ID for commit/abort
+    bool can_commit = 3 [(buf.validate.field).required = true];                 // REQUIRED: Whether transaction can be committed
+    google.protobuf.Any projected_state = 4;  // OPTIONAL: Projected state after commit
+    string prepare_info = 5;             // OPTIONAL: Additional prepare context
+}
+
+// Transition error details
+message TransitionError {
+    ErrorCode code = 1 [(buf.validate.field).required = true, (buf.validate.field).enum.defined_only = true];           // REQUIRED: Error code from standardized enum
+    string message = 2 [(buf.validate.field).required = true, (buf.validate.field).string.min_len = 1];                  // REQUIRED: Human-readable error message
+    string field_path = 3;               // OPTIONAL: Field path for validation errors
+    string details = 4;                  // OPTIONAL: Additional error context
+}
+
+// Status of prepare phase in 2PC
+enum PrepareStatus {
+    PREPARE_STATUS_UNSPECIFIED = 0;
+    PREPARE_STATUS_PREPARED = 1;         // Ready to commit
+    PREPARE_STATUS_ABORT_TRANSACTION = 2; // Transaction should be aborted
+    PREPARE_STATUS_READ_ONLY = 3;        // No changes, commit not needed
+    PREPARE_STATUS_ERROR = 4;            // Error occurred during prepare
+}
+
+// Processing status enumeration
+enum ProcessingStatus {
+    PROCESSING_STATUS_UNSPECIFIED = 0;
+    PROCESSING_STATUS_ACCEPTED = 1;      // Event accepted for processing
+    PROCESSING_STATUS_REJECTED = 2;      // Event rejected (validation failed)
+    PROCESSING_STATUS_IGNORED = 3;       // Event ignored (duplicate/irrelevant)
+    PROCESSING_STATUS_DEFERRED = 4;      // Event deferred (dependencies not met)
+    PROCESSING_STATUS_FAILED = 5;        // Processing failed with error
+    PROCESSING_STATUS_PROCESSED = 6;     // Successfully processed
+    PROCESSING_STATUS_SKIPPED = 7;       // Skipped (idempotency)
+}
+
+
+
+// Standardized error codes for consistency across engines
+enum ErrorCode {
+    ERROR_CODE_UNSPECIFIED = 0;
+    
+    // Initialization errors
+    ERROR_CODE_ALREADY_INITIALIZED = 1;
+    ERROR_CODE_INITIALIZATION_FAILED = 2;
+    ERROR_CODE_INVALID_INITIAL_STATE = 3;
+    
+    // State validation errors  
+    ERROR_CODE_INVALID_STATE = 4;
+    ERROR_CODE_STATE_CORRUPTION = 5;
+    ERROR_CODE_MISSING_REQUIRED_FIELD = 6;
+    
+    // Event processing errors
+    ERROR_CODE_PROCESSING_FAILED = 7;
+    ERROR_CODE_INVALID_EVENT = 8;
+    ERROR_CODE_EVENT_TOO_OLD = 9;
+    ERROR_CODE_EVENT_TOO_NEW = 10;
+    ERROR_CODE_DUPLICATE_SEQUENCE = 11;
+    
+    // Transaction errors
+    ERROR_CODE_TRANSACTION_CONFLICT = 12;
+    ERROR_CODE_TRANSACTION_TIMEOUT = 13;
+    ERROR_CODE_TRANSACTION_ABORTED = 14;
+    ERROR_CODE_PREPARE_FAILED = 15;
+    ERROR_CODE_COMMIT_FAILED = 16;
+    
+    // Resource errors
+    ERROR_CODE_MEMORY_LIMIT_EXCEEDED = 17;
+    ERROR_CODE_CPU_LIMIT_EXCEEDED = 18;
+    ERROR_CODE_TIMEOUT = 19;
+    
+    // Business logic errors
+    ERROR_CODE_BUSINESS_RULE_VIOLATION = 20;
+    ERROR_CODE_PRECONDITION_FAILED = 21;
+    ERROR_CODE_POSTCONDITION_FAILED = 22;
+    
+    // System errors
+    ERROR_CODE_INTERNAL_ERROR = 23;
+    ERROR_CODE_NOT_IMPLEMENTED = 24;
+    ERROR_CODE_CONFIGURATION_ERROR = 25;
+} 

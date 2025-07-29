@@ -1,0 +1,58 @@
+syntax = "proto3";
+
+package engines.base.v1;
+
+option go_package = "github.com/amrita/core-engine/proto/engines/base/v1;basev1";
+
+import "google/protobuf/timestamp.proto";
+import "buf/validate/validate.proto";
+
+// Base engine infrastructure state - separate from business state
+// This follows the BaseWorkflow pattern with infrastructure concerns
+message BaseEngineState {
+    // Core engine lifecycle
+    bool initialized = 1;
+    EngineStatus status = 2 [(buf.validate.field).enum.defined_only = true];
+    google.protobuf.Timestamp initialized_at = 3;
+    
+    // Event processing state
+    int64 last_processed_sequence = 4 [(buf.validate.field).int64.gte = 0];
+    
+    // Transaction state for 2PC
+    TransactionState transaction_state = 5 [(buf.validate.field).enum.defined_only = true];
+    int64 current_transaction_id = 6 [(buf.validate.field).int64.gte = 0];
+    int64 transaction_counter = 7 [(buf.validate.field).int64.gte = 0];
+    
+    // Resource tracking (future extensibility)
+    int64 total_events_processed = 8 [(buf.validate.field).int64.gte = 0];
+    google.protobuf.Timestamp last_activity_at = 9;
+    
+    // Error tracking
+    int32 consecutive_failures = 10 [(buf.validate.field).int32.gte = 0];
+    google.protobuf.Timestamp last_failure_at = 11;
+    string last_error_code = 12 [(buf.validate.field).string.max_len = 100];
+}
+
+// Engine lifecycle status
+enum EngineStatus {
+    ENGINE_STATUS_UNSPECIFIED = 0;
+    ENGINE_STATUS_INITIALIZING = 1;   // setInitialState() in progress
+    ENGINE_STATUS_READY = 2;          // Initialized and ready for events
+    ENGINE_STATUS_PROCESSING = 3;     // Currently processing events
+    ENGINE_STATUS_DEGRADED = 4;       // Operating with limited functionality
+    ENGINE_STATUS_FAILED = 5;         // Engine has failed and needs intervention
+    ENGINE_STATUS_SHUTTING_DOWN = 6;  // Engine is being shut down
+    ENGINE_STATUS_STOPPED = 7;        // Engine has been stopped
+}
+
+// Transaction state for 2PC pattern  
+enum TransactionState {
+    TRANSACTION_STATE_UNSPECIFIED = 0;
+    TRANSACTION_IDLE = 1;                // No active transaction
+    TRANSACTION_PREPARING = 2;           // Prepare phase in progress
+    TRANSACTION_PREPARED = 3;            // Prepared and ready to commit
+    TRANSACTION_COMMITTING = 4;          // Commit phase in progress  
+    TRANSACTION_COMMITTED = 5;           // Transaction committed successfully
+    TRANSACTION_ABORTING = 6;            // Abort phase in progress
+    TRANSACTION_ABORTED = 7;             // Transaction aborted
+} 
