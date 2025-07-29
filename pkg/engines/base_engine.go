@@ -85,13 +85,13 @@ func (e *BaseEngine[TState, TEvent, TTransitionInfo]) SetInitialState(
 		return zero, NewAlreadyInitializedError()
 	}
 	
-	// Validate the initial state
-	if err := e.validateState(initialState); err != nil {
+	// Apply business defaults FIRST
+	stateWithDefaults := e.applyDefaults(initialState)
+	
+	// Validate the state AFTER applying defaults
+	if err := e.validateState(stateWithDefaults); err != nil {
 		return zero, NewValidationError("initialState", err.Error())
 	}
-	
-	// Apply business defaults
-	stateWithDefaults := e.applyDefaults(initialState)
 	
 	// Set the state
 	e.businessState = stateWithDefaults
