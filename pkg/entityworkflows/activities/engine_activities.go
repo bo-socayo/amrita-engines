@@ -28,6 +28,19 @@ type ProcessEventActivityResult struct {
 	ErrorMessage   string `json:"error_message,omitempty"`
 }
 
+// CompressStateActivityInput contains all data needed for engine state compression
+type CompressStateActivityInput struct {
+	EntityType   string `json:"entity_type"`
+	CurrentState []byte `json:"current_state"` // Serialized state to compress
+}
+
+// CompressStateActivityResult contains the results of engine state compression
+type CompressStateActivityResult struct {
+	CompressedState []byte `json:"compressed_state"` // Serialized compressed state
+	Success         bool   `json:"success"`
+	ErrorMessage    string `json:"error_message,omitempty"`
+}
+
 // ProcessEventActivity wraps engine.ProcessEvent for deterministic execution
 // This is a generic activity that works with any engine type
 func ProcessEventActivity[TState, TEvent, TTransitionInfo proto.Message](

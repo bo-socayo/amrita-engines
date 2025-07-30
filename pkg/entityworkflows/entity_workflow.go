@@ -114,6 +114,47 @@ func EntityWorkflow[TState, TEvent, TTransitionInfo proto.Message](
 			SequenceNumber: input.SequenceNumber,
 		}, nil
 	}
+
+	// Create local CompressStateActivity with engine captured (NO GLOBAL REGISTRY!)
+	localCompressStateActivity := func(ctx context.Context, input activities.CompressStateActivityInput) (*activities.CompressStateActivityResult, error) {
+		// Deserialize current state
+		var currentState TState
+		if len(input.CurrentState) > 0 {
+			currentState = utils.NewInstance[TState]()
+			if err := proto.Unmarshal(input.CurrentState, currentState); err != nil {
+				return &activities.CompressStateActivityResult{
+					Success:      false,
+					ErrorMessage: fmt.Sprintf("failed to deserialize current state: %v", err),
+				}, nil
+			}
+		} else {
+			currentState = utils.NewInstance[TState]()
+		}
+
+		// Use the engine instance directly that was passed to the workflow
+		// Compress state through the injected engine
+		compressedState, err := engine.CompressState(ctx, currentState)
+		if err != nil {
+			return &activities.CompressStateActivityResult{
+				Success:      false,
+				ErrorMessage: fmt.Sprintf("engine compression failed: %v", err),
+			}, nil
+		}
+
+		// Serialize compressed state
+		compressedStateBytes, err := proto.Marshal(compressedState)
+		if err != nil {
+			return &activities.CompressStateActivityResult{
+				Success:      false,
+				ErrorMessage: fmt.Sprintf("failed to serialize compressed state: %v", err),
+			}, nil
+		}
+
+		return &activities.CompressStateActivityResult{
+			Success:         true,
+			CompressedState: compressedStateBytes,
+		}, nil
+	}
 	
 	logger.Info("🚀 EntityWorkflow starting", "entityId", params.EntityId, "entityType", entityType)
 
@@ -512,13 +553,59 @@ func EntityWorkflow[TState, TEvent, TTransitionInfo proto.Message](
 	}
 
 	// ✅ Give engine a chance to compress/optimize state before continue-as-new
-	logger.Info("🗜️  Calling engine CompressState hook before continue-as-new")
-	engineCtx = context.Background()
-	compressedState, err = engine.CompressState(engineCtx, currentState)
+	logger.Info("🗜️  Calling engine CompressState activity before continue-as-new")
+	
+	// Serialize current state for compression activity
+	currentStateBytes, err := proto.Marshal(currentState)
 	if err != nil {
-		logger.Error("❌ Engine CompressState failed", "error", err)
-		return fmt.Errorf("failed to compress state for continue-as-new: %w", err)
+		logger.Error("❌ Failed to serialize current state for compression", "error", err)
+		return fmt.Errorf("failed to serialize current state for compression: %w", err)
 	}
+	
+	// Prepare compression activity input
+	compressInput := activities.CompressStateActivityInput{
+		EntityType:   entityType,
+		CurrentState: currentStateBytes,
+	}
+	
+	// Configure local activity options for compression
+	compressionActivityOptions := workflow.LocalActivityOptions{
+		ScheduleToCloseTimeout: 30 * time.Second, // Compression should be fast
+		RetryPolicy: &temporal.RetryPolicy{
+			InitialInterval:    100 * time.Millisecond,
+			BackoffCoefficient: 1.5,
+			MaximumInterval:    5 * time.Second,
+			MaximumAttempts:    3, // Limited retries for compression failures
+			NonRetryableErrorTypes: []string{
+				"ValidationError",
+			},
+		},
+	}
+	
+	ctx = workflow.WithLocalActivityOptions(ctx, compressionActivityOptions)
+	
+	// Execute compression in local activity
+	var compressResult activities.CompressStateActivityResult
+	err = workflow.ExecuteLocalActivity(ctx, localCompressStateActivity, compressInput).Get(ctx, &compressResult)
+	if err != nil {
+		logger.Error("❌ Compression activity execution failed", "error", err)
+		return fmt.Errorf("compression activity failed: %w", err)
+	}
+	
+	if !compressResult.Success {
+		logger.Error("❌ Engine compression failed", "error", compressResult.ErrorMessage)
+		return fmt.Errorf("engine compression failed: %s", compressResult.ErrorMessage)
+	}
+	
+	// Deserialize compressed state
+	compressedState = utils.NewInstance[TState]()
+	err = proto.Unmarshal(compressResult.CompressedState, compressedState)
+	if err != nil {
+		logger.Error("❌ Failed to deserialize compressed state", "error", err)
+		return fmt.Errorf("failed to deserialize compressed state: %w", err)
+	}
+	
+	logger.Info("✅ State compression completed successfully")
 	
 	// ✅ Prepare cutoff for next workflow and create new state with preserved sequence number and metadata
 	cutoffForNext := workflowState.GetIdempotencyCutoffForContinuation(ctx)
@@ -536,7 +623,9 @@ func EntityWorkflow[TState, TEvent, TTransitionInfo proto.Message](
 		"sequenceNumber", workflowState.GetSequenceNumber(),
 		"idempotencyCutoff", cutoffForNext)
 
-	return workflow.NewContinueAsNewError(ctx, EntityWorkflow[TState, TEvent, TTransitionInfo], newParams, engine, idHandler)
+	// Get the current workflow type name for continue-as-new
+	workflowType := workflow.GetInfo(ctx).WorkflowType.Name
+	return workflow.NewContinueAsNewError(ctx, workflowType, newParams)
 }
 
 // Continue-as-new logic is now in the state package

@@ -67,7 +67,7 @@ func DemoEntityWorkflow(
 	engine := engines.NewBaseEngine(config)
 	idHandler := &DemoWorkflowIDHandler{}
 
-	// Use the generic entity workflow - match the pattern from other engines
+	// Use the generic entity workflow - it now handles continue-as-new with correct workflow name
 	return entityworkflows.EntityWorkflow[*demov1.DemoEngineState, *demov1.DemoEngineSignal, *demov1.DemoEngineTransitionInfo](
 		ctx, 
 		params, 

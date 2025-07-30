@@ -2,6 +2,8 @@ package demo_engine
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -9,7 +11,9 @@ import (
 	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/testsuite"
 	"go.temporal.io/sdk/worker"
+	"go.temporal.io/sdk/workflow"
 	"google.golang.org/protobuf/types/known/timestamppb"
+	"google.golang.org/protobuf/encoding/protojson"
 
 	"github.com/bo-socayo/amrita-engines/pkg/entityworkflows"
 	demov1 "github.com/bo-socayo/amrita-engines/gen/engines/demo/v1"
@@ -45,8 +49,10 @@ func (s *DemoEntityWorkflowContinueAsNewTestSuite) SetupSuite() {
 	// Create worker (shared across all tests in suite)
 	s.worker = worker.New(s.client, s.taskQueue, worker.Options{})
 	
-	// Register the entity workflow - it comes with activities built-in now!
-	s.worker.RegisterWorkflow(DemoEntityWorkflow)
+	// Register the entity workflow with explicit name - it comes with activities built-in now!
+	s.worker.RegisterWorkflowWithOptions(DemoEntityWorkflow, workflow.RegisterOptions{
+		Name: "DemoEntityWorkflow",
+	})
 	
 	// Start worker once for the entire suite
 	go func() {
@@ -559,4 +565,159 @@ func (s *DemoEntityWorkflowContinueAsNewTestSuite) TestWorkflowIdempotencyAcross
 	// Should contain only one event despite multiple requests
 	
 	s.T().Log("✅ Idempotency continue-as-new test completed successfully!")
+}
+
+// TestActualContinueAsNewAndCompression sends 1000+ events to actually trigger continue-as-new and compression
+func (s *DemoEntityWorkflowContinueAsNewTestSuite) TestActualContinueAsNewAndCompression() {
+	initialState := &demov1.DemoEngineState{
+		CurrentValue: 0,
+		Config: &demov1.DemoConfig{
+			MaxValue:         100000, // High limit to avoid hitting max during test
+			DefaultIncrement: 1,
+			AllowNegative:    false,
+			Description:      "Actual continue-as-new compression test",
+		},
+		History:     []*demov1.CounterEvent{},
+		NextEventId: 1,
+	}
+
+	params := entityworkflows.EntityWorkflowParams[*demov1.DemoEngineState]{
+		EntityId:     "test-actual-continue-as-new-compression",
+		InitialState: initialState,
+	}
+
+	// Start the workflow
+	s.T().Log("🚀 Starting workflow for ACTUAL continue-as-new test")
+	workflowRun, err := s.client.ExecuteWorkflow(context.Background(), client.StartWorkflowOptions{
+		ID:        "test-actual-continue-as-new-workflow-" + time.Now().Format("20060102-150405-000"),
+		TaskQueue: s.taskQueue,
+	}, "DemoEntityWorkflow", params)
+	s.Require().NoError(err)
+	s.T().Log("📋 Workflow started")
+
+	// Give workflow a moment to initialize
+	time.Sleep(300 * time.Millisecond)
+
+	// Send events until continue-as-new is triggered (threshold is 1000)
+	const maxEvents = 1010
+	s.T().Logf("📦 Sending up to %d events to trigger continue-as-new", maxEvents)
+	
+	originalRunID := workflowRun.GetRunID()
+	var finalValue int64 = 0
+	var actualEventsSent = 0
+	continueAsNewDetected := false
+	
+	for i := 0; i < maxEvents; i++ {
+		incrementSignal := &demov1.DemoEngineSignal{
+			Signal: &demov1.DemoEngineSignal_Increment{
+				Increment: &demov1.IncrementSignal{
+					Amount:    1,
+					Reason:    fmt.Sprintf("Continue-as-new test event %d", i+1),
+					Timestamp: timestamppb.Now(),
+				},
+			},
+		}
+
+		requestCtx := &entityv1.RequestContext{
+			UserId:         "test-user",
+			OrgId:          "test-org",
+			TeamId:         "test-team",
+			Environment:    "test",
+			Tenant:         "test-tenant",
+			IdempotencyKey: fmt.Sprintf("actual-continue-as-new-event-%d", i+1),
+			RequestTime:    timestamppb.Now(),
+		}
+
+		updateHandle, err := s.client.UpdateWorkflow(context.Background(), client.UpdateWorkflowOptions{
+			WorkflowID:   workflowRun.GetID(),
+			RunID:        "", // Let Temporal find the current run
+			UpdateName:   "processEvent",
+			WaitForStage: client.WorkflowUpdateStageCompleted,
+			Args:         []interface{}{requestCtx, incrementSignal},
+		})
+		
+		// Check for continue-as-new backoff error (expected behavior)
+		if err != nil && strings.Contains(err.Error(), "Backoff for continue-as-new") {
+			s.T().Logf("🔄 Continue-as-new backoff detected at event %d - this is expected!", i+1)
+			continueAsNewDetected = true
+			break
+		}
+		s.Require().NoError(err)
+		
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		
+		var result *demov1.DemoEngineState
+		err = updateHandle.Get(ctx, &result)
+		if err != nil && strings.Contains(err.Error(), "Backoff for continue-as-new") {
+			s.T().Logf("🔄 Continue-as-new backoff detected at event %d result - this is expected!", i+1)
+			continueAsNewDetected = true
+			cancel()
+			break
+		}
+		s.Require().NoError(err)
+		
+		finalValue = result.CurrentValue
+		actualEventsSent = i + 1
+		
+		// Every 100 events, log progress and check if continue-as-new happened
+		if (i+1)%100 == 0 {
+			s.T().Logf("📈 Progress: %d/%d events sent, currentValue: %d", i+1, maxEvents, finalValue)
+			
+			// Check if we're on a new run ID (continue-as-new happened)
+			currentRun, err := s.client.DescribeWorkflowExecution(context.Background(), workflowRun.GetID(), "")
+			s.Require().NoError(err)
+			
+			currentRunID := currentRun.GetWorkflowExecutionInfo().GetExecution().GetRunId()
+			if currentRunID != originalRunID {
+				s.T().Logf("🔄 CONTINUE-AS-NEW DETECTED! Original run: %s, Current run: %s", 
+					originalRunID[:8], currentRunID[:8])
+				// Update our reference for subsequent calls
+				originalRunID = currentRunID
+			}
+		}
+	}
+
+	s.T().Log("🔍 Verifying final state after continue-as-new and compression")
+	
+	// Verify that continue-as-new was properly detected
+	s.True(continueAsNewDetected, "Continue-as-new should have been detected")
+	s.Greater(actualEventsSent, 100, "Should have sent a reasonable number of events before continue-as-new")
+	s.T().Logf("✅ Continue-as-new triggered after %d events as expected", actualEventsSent)
+	
+	// Query final state (this might be from the new workflow execution after continue-as-new)
+	response, err := s.client.QueryWorkflow(context.Background(), workflowRun.GetID(), "", "getEntityState")
+	s.NoError(err)
+	
+	var queryResponse entityworkflows.EntityQueryResponse[*demov1.DemoEngineState]
+	err = response.Get(&queryResponse)
+	s.NoError(err)
+	
+	s.True(queryResponse.IsInitialized)
+	
+	// Verify final value accumulated the events that were actually sent
+	s.Equal(finalValue, int64(actualEventsSent))
+	s.T().Logf("📊 Final value: %d (matches %d events sent)", finalValue, actualEventsSent)
+	
+	// Key compression verification: History should be limited due to compression
+	// The demo engine compresses history to max 50 events (see CompressState in engine.go)
+	s.Contains(queryResponse.CurrentStateJSON, `"history"`)
+	
+	// Parse the state to check compression actually worked
+	var finalState demov1.DemoEngineState
+	err = protojson.Unmarshal([]byte(queryResponse.CurrentStateJSON), &finalState)
+	s.NoError(err)
+	
+	// CRITICAL TEST: History should be compressed to ≤ 50 events even though we sent 1010
+	s.T().Logf("📊 Final history length: %d events (should be ≤ 50 due to compression)", len(finalState.History))
+	s.LessOrEqual(len(finalState.History), 50, "History should be compressed to max 50 events")
+	
+	// Verify essential state preservation across continue-as-new
+	s.Equal(finalState.CurrentValue, int64(actualEventsSent))
+	s.Equal("Actual continue-as-new compression test", finalState.Config.Description)
+	s.Equal(int64(100000), finalState.Config.MaxValue)
+	
+	s.T().Log("✅ ACTUAL continue-as-new and compression test completed successfully!")
+	s.T().Logf("✨ Verified: Sent %d events, final value %d, compressed history to %d events", 
+		actualEventsSent, finalState.CurrentValue, len(finalState.History))
 } 
