@@ -341,9 +341,11 @@ func (s *DemoEntityQueryIntegrationTestSuite) TestQueryAfterMultipleOperations()
 	err = response.Get(&finalResponse)
 	s.NoError(err)
 
-	// Should have 3 events in history and current value should be 0 (after reset)
-	s.Contains(finalResponse.CurrentStateJSON, `"currentValue":"0"`)
+	// Should have 3 events in history and next event ID should be 4 (after reset)
+	// Note: currentValue is omitted when 0 due to omitempty JSON tag
 	s.Contains(finalResponse.CurrentStateJSON, `"nextEventId":"4"`)
+	// Verify the reset event is in history
+	s.Contains(finalResponse.CurrentStateJSON, `"type":"COUNTER_EVENT_TYPE_RESET"`)
 	
 	s.T().Log("✅ Multiple operations test completed successfully!")
 }
