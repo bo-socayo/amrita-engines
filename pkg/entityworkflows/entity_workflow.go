@@ -32,6 +32,7 @@ type EntityWorkflowState struct {
 	requestsBeforeCAN    int                  // Threshold for continue-as-new
 	idempotencyCutoff    time.Time            // ✅ Cutoff from previous workflow (inclusive boundary)
 	sequenceNumber       int64                // ✅ Monotonic counter preserved across continue-as-new
+	entityMetadata       *entityv1.EntityMetadata // ✅ Preserved EntityMetadata across continue-as-new
 }
 
 // NewEntityWorkflowState creates initial workflow state
@@ -43,11 +44,12 @@ func NewEntityWorkflowState(idempotencyCutoff time.Time) *EntityWorkflowState {
 		requestsBeforeCAN:    1000,        // ✅ Reasonable default from docs
 		idempotencyCutoff:    idempotencyCutoff, // ✅ Cutoff from previous workflow
 		sequenceNumber:       0,           // ✅ Starts at 0 for new workflows
+		entityMetadata:       nil,         // ✅ Will be initialized from first RequestContext
 	}
 }
 
-// NewEntityWorkflowStateForContinuation creates workflow state for continue-as-new with preserved sequence number
-func NewEntityWorkflowStateForContinuation(idempotencyCutoff time.Time, sequenceNumber int64) *EntityWorkflowState {
+// NewEntityWorkflowStateForContinuation creates workflow state for continue-as-new with preserved sequence number and metadata
+func NewEntityWorkflowStateForContinuation(idempotencyCutoff time.Time, sequenceNumber int64, entityMetadata *entityv1.EntityMetadata) *EntityWorkflowState {
 	return &EntityWorkflowState{
 		requestCount:         0,           // ✅ Reset counters
 		pendingUpdates:       0,           // ✅ Reset counters
@@ -55,6 +57,7 @@ func NewEntityWorkflowStateForContinuation(idempotencyCutoff time.Time, sequence
 		requestsBeforeCAN:    1000,        // ✅ Reset threshold
 		idempotencyCutoff:    idempotencyCutoff, // ✅ Preserved cutoff
 		sequenceNumber:       sequenceNumber,   // ✅ CRITICAL: Preserve monotonic sequence
+		entityMetadata:       entityMetadata,   // ✅ CRITICAL: Preserve authorization context
 	}
 }
 
@@ -117,9 +120,9 @@ func newInstance[T any]() T {
 
 // EntityWorkflowParams contains the parameters for starting an entity workflow
 type EntityWorkflowParams[TState proto.Message] struct {
-	InitialState   TState                   `json:"initial_state"`
-	Metadata       *entityv1.EntityMetadata `json:"metadata"`
-	WorkflowState  *EntityWorkflowState     `json:"workflow_state,omitempty"`
+	EntityId      string               `json:"entity_id"`       // Required: Entity identifier  
+	InitialState  TState               `json:"initial_state"`   // Optional: Initial state
+	WorkflowState *EntityWorkflowState `json:"workflow_state,omitempty"` // Internal: for continue-as-new
 }
 
 // EntityQueryResponse contains the full engine state for queries
@@ -202,11 +205,12 @@ func EntityWorkflow[TState, TEvent, TTransitionInfo proto.Message](
 	engine engines.Engine[TState, TEvent, TTransitionInfo],
 	idHandler WorkflowIDHandler,
 ) error {
-	// Auto-derive entity type from the engine's state protobuf type
-	params.Metadata.EntityType = GetEntityTypeFromProtobuf[TState]()
-	
 	logger := workflow.GetLogger(ctx)
-	logger.Info("🚀 EntityWorkflow starting", "entityId", params.Metadata.EntityId, "entityType", params.Metadata.EntityType)
+	
+	// Auto-derive entity type from the engine's state protobuf type
+	entityType := GetEntityTypeFromProtobuf[TState]()
+	
+	logger.Info("🚀 EntityWorkflow starting", "entityId", params.EntityId, "entityType", entityType)
 
 	// ✅ Initialize workflow state tracking
 	var workflowState *EntityWorkflowState
@@ -216,6 +220,21 @@ func EntityWorkflow[TState, TEvent, TTransitionInfo proto.Message](
 	} else {
 		workflowState = NewEntityWorkflowState(time.Time{}) // No cutoff for new workflows
 		logger.Info("🆕 Created new workflow state")
+	}
+	
+	// Initialize EntityMetadata - either from workflowState (continue-as-new) or first RequestContext
+	var entityMetadata *entityv1.EntityMetadata
+	var metadataInitialized bool
+	
+	// Check if EntityMetadata was preserved from continue-as-new
+	if workflowState.entityMetadata != nil {
+		entityMetadata = workflowState.entityMetadata
+		metadataInitialized = true
+		logger.Info("✅ EntityMetadata restored from continue-as-new", 
+			"orgId", entityMetadata.OrgId, 
+			"teamId", entityMetadata.TeamId,
+			"userId", entityMetadata.UserId,
+			"tenant", entityMetadata.Tenant)
 	}
 	
 	// === TEMPORAL WORKFLOW STATE MANAGEMENT ===
@@ -238,7 +257,16 @@ func EntityWorkflow[TState, TEvent, TTransitionInfo proto.Message](
 	// Temporal ensures this is deterministic across replays
 	logger.Info("🔧 Starting engine initialization")
 	engineCtx := context.Background()
-	finalState, err := engine.SetInitialState(engineCtx, currentState, params.Metadata.CreatedAt)
+	
+	// Use creation time from entityMetadata if available, otherwise current workflow time
+	var createdAt *timestamppb.Timestamp
+	if entityMetadata != nil && entityMetadata.CreatedAt != nil {
+		createdAt = entityMetadata.CreatedAt
+	} else {
+		createdAt = timestamppb.New(workflow.Now(ctx))
+	}
+	
+	finalState, err := engine.SetInitialState(engineCtx, currentState, createdAt)
 	if err != nil {
 		logger.Error("❌ Engine initialization failed", "error", err)
 		return fmt.Errorf("failed to initialize engine: %w", err)
@@ -269,7 +297,7 @@ func EntityWorkflow[TState, TEvent, TTransitionInfo proto.Message](
 			logger.Info("✅ Zero state marshaled", "jsonLength", len(stateJSON))
 			return &EntityQueryResponse[TState]{
 				CurrentStateJSON: string(stateJSON),
-				Metadata:         params.Metadata,
+				Metadata:         entityMetadata, // May be nil if no requests received yet
 				IsInitialized:    false,
 			}, nil
 		}
@@ -292,25 +320,32 @@ func EntityWorkflow[TState, TEvent, TTransitionInfo proto.Message](
 			return nil, fmt.Errorf("failed to marshal current state to JSON: %w", err)
 		}
 		
-		logger.Info("✅ Successfully marshaled state to JSON", 
-			"jsonLength", len(stateJSON), 
-			"isEmpty", len(stateJSON) == 0,
-			"preview", string(stateJSON)[:min(len(stateJSON), 200)])
+					logger.Info("✅ Successfully marshaled state to JSON", 
+				"jsonLength", len(stateJSON), 
+				"isEmpty", len(stateJSON) == 0,
+				"preview", string(stateJSON)[:min(len(stateJSON), 200)])
 
-		response := &EntityQueryResponse[TState]{
-			CurrentStateJSON: string(stateJSON),
-			Metadata:         params.Metadata,
-			IsInitialized:    true,
-		}
-		
-		logger.Info("🎯 Returning query response", 
-			"responseJSONLength", len(response.CurrentStateJSON),
-			"metadataEntityId", response.Metadata.EntityId)
+			response := &EntityQueryResponse[TState]{
+				CurrentStateJSON: string(stateJSON),
+				Metadata:         entityMetadata,
+				IsInitialized:    true,
+			}
+			
+			var entityId string
+			if entityMetadata != nil {
+				entityId = entityMetadata.EntityId
+			} else {
+				entityId = params.EntityId
+			}
+			
+			logger.Info("🎯 Returning query response", 
+				"responseJSONLength", len(response.CurrentStateJSON),
+				"metadataEntityId", entityId)
 		
 		return response, nil
 	})
 
-	// ✅ Register update handler with proper EntityMetadata and RequestContext
+	// ✅ Register update handler with proper authorization and RequestContext
 	workflow.SetUpdateHandlerWithOptions(ctx, "processEvent", 
 		func(ctx workflow.Context, requestCtx *entityv1.RequestContext, event TEvent) (TState, error) {
 			logger := workflow.GetLogger(ctx)
@@ -320,6 +355,52 @@ func EntityWorkflow[TState, TEvent, TTransitionInfo proto.Message](
 			if !initialized {
 				logger.Error("❌ ProcessEvent called but entity not initialized")
 				return zero, fmt.Errorf("entity not initialized")
+			}
+
+			// ✅ Initialize or validate EntityMetadata from RequestContext
+			if !metadataInitialized {
+				// First request - initialize EntityMetadata from RequestContext
+				if requestCtx == nil {
+					logger.Error("❌ First request must include RequestContext for authorization")
+					return zero, fmt.Errorf("first request must include RequestContext")
+				}
+				
+				entityMetadata = &entityv1.EntityMetadata{
+					EntityId:    params.EntityId,
+					EntityType:  entityType,
+					OrgId:       requestCtx.OrgId,
+					TeamId:      requestCtx.TeamId,
+					UserId:      requestCtx.UserId,
+					Environment: requestCtx.Environment,
+					Tenant:      requestCtx.Tenant,
+					CreatedAt:   timestamppb.New(workflow.Now(ctx)),
+				}
+				
+				// Store in workflowState for persistence across continue-as-new
+				workflowState.entityMetadata = entityMetadata
+				metadataInitialized = true
+				
+				logger.Info("✅ EntityMetadata initialized from first RequestContext", 
+					"orgId", entityMetadata.OrgId, 
+					"teamId", entityMetadata.TeamId,
+					"userId", entityMetadata.UserId,
+					"tenant", entityMetadata.Tenant)
+			} else {
+				// Subsequent requests - validate authorization
+				if requestCtx == nil {
+					logger.Error("❌ RequestContext required for authorization")
+					return zero, fmt.Errorf("RequestContext required")
+				}
+				
+				if !authorizeRequest(requestCtx, entityMetadata) {
+					logger.Error("❌ Authorization failed - RequestContext doesn't match EntityMetadata",
+						"requestOrgId", requestCtx.OrgId,
+						"entityOrgId", entityMetadata.OrgId,
+						"requestTenant", requestCtx.Tenant,
+						"entityTenant", entityMetadata.Tenant)
+					return zero, fmt.Errorf("authorization failed: tenant/org mismatch")
+				}
+				logger.Debug("✅ Authorization validated")
 			}
 
 			// ✅ Acquire mutex for concurrent protection
@@ -353,7 +434,7 @@ func EntityWorkflow[TState, TEvent, TTransitionInfo proto.Message](
 			// Create typed event envelope (passing nil for metadata for now)
 			envelope, err := engines.NewTypedEventEnvelope(
 				workflowState.sequenceNumber,
-				fmt.Sprintf("%s.event", params.Metadata.EntityType),
+				fmt.Sprintf("%s.event", entityType),
 				timestamppb.New(workflow.Now(ctx)),
 				event,
 				nil, // TODO: Convert map[string]string metadata to protobuf
@@ -441,14 +522,14 @@ func EntityWorkflow[TState, TEvent, TTransitionInfo proto.Message](
 		return fmt.Errorf("failed to compress state for continue-as-new: %w", err)
 	}
 	
-	// ✅ Prepare cutoff for next workflow and create new state with preserved sequence number
+	// ✅ Prepare cutoff for next workflow and create new state with preserved sequence number and metadata
 	cutoffForNext := workflowState.getIdempotencyCutoffForContinuation(ctx)
-	newWorkflowState := NewEntityWorkflowStateForContinuation(cutoffForNext, workflowState.sequenceNumber)
+	newWorkflowState := NewEntityWorkflowStateForContinuation(cutoffForNext, workflowState.sequenceNumber, workflowState.entityMetadata)
 	
 	// ✅ Continue as new with compressed state and preserved workflow state
 	newParams := EntityWorkflowParams[TState]{
+		EntityId:      params.EntityId,    // Entity ID persists
 		InitialState:  compressedState,    // ✅ Use compressed state from engine
-		Metadata:      params.Metadata,    // Entity metadata persists
 		WorkflowState: newWorkflowState,   // ✅ Fresh workflow state with preserved sequence + cutoff
 	}
 
@@ -488,6 +569,20 @@ func BuildEntityWorkflowIDFromProtobuf[T proto.Message](entityID string) string 
 // - BuildDeterministicWorkflowID() 
 // - BuildEntityWorkflowIDFromParts()
 // - Complex parsing logic
+
+// authorizeRequest validates that the RequestContext matches the established EntityMetadata
+func authorizeRequest(requestCtx *entityv1.RequestContext, entityMetadata *entityv1.EntityMetadata) bool {
+	if requestCtx == nil || entityMetadata == nil {
+		return false
+	}
+	
+	// Check all authorization fields must match
+	return requestCtx.OrgId == entityMetadata.OrgId &&
+		   requestCtx.TeamId == entityMetadata.TeamId &&
+		   requestCtx.UserId == entityMetadata.UserId &&
+		   requestCtx.Tenant == entityMetadata.Tenant &&
+		   requestCtx.Environment == entityMetadata.Environment
+}
 
 // Helper function to parse entity workflow ID
 func ParseEntityWorkflowID(workflowID string) (entityType, entityID string, err error) {

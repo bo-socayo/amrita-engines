@@ -16,7 +16,7 @@ message EntityMetadata {
   
   // 🟢 AUTHORIZATION & TENANCY CONTEXT (set once at workflow start)
   string org_id = 3 [(buf.validate.field).string.min_len = 1];        // Organization identifier
-  string team_id = 4;                                                 // Team within organization  
+  string team_id = 4 [(buf.validate.field).string.min_len = 1];        // Team within organization  
   string user_id = 5 [(buf.validate.field).string.min_len = 1];       // Acting user
   string environment = 6 [(buf.validate.field).string = {in: ["dev", "staging", "prod"]}]; // Environment
   string tenant = 7 [(buf.validate.field).string.min_len = 1];        // Top-level tenant isolation
@@ -30,15 +30,16 @@ message EntityMetadata {
 message RequestContext {
   // 🔐 AUTHORIZATION (per-request - eventually from JWT)
   string org_id = 1 [(buf.validate.field).string.min_len = 1];        // Organization making the request
-  string user_id = 2 [(buf.validate.field).string.min_len = 1];       // User making the request  
-  string tenant = 3 [(buf.validate.field).string.min_len = 1];        // Tenant context
-  string environment = 4 [(buf.validate.field).string = {in: ["dev", "staging", "prod"]}]; // Environment
+  string team_id = 2 [(buf.validate.field).string.min_len = 1];       // Team within organization
+  string user_id = 3 [(buf.validate.field).string.min_len = 1];       // User making the request  
+  string tenant = 4 [(buf.validate.field).string.min_len = 1];        // Tenant context
+  string environment = 5 [(buf.validate.field).string = {in: ["dev", "staging", "prod"]}]; // Environment
   
   // 🆔 REQUEST IDENTITY & DEDUPLICATION
-  string idempotency_key = 5 [(buf.validate.field).string.min_len = 1, (buf.validate.field).string.max_len = 255]; // Client-provided idempotency key
-  google.protobuf.Timestamp request_time = 6;                         // When this specific request was made
+  string idempotency_key = 6 [(buf.validate.field).string.min_len = 1, (buf.validate.field).string.max_len = 255]; // Client-provided idempotency key
+  google.protobuf.Timestamp request_time = 7;                         // When this specific request was made
   
   // 📊 OBSERVABILITY (optional)
-  string request_id = 7;       // Request tracing ID
-  string trace_id = 8;         // Distributed tracing ID
+  string request_id = 8;       // Request tracing ID
+  string trace_id = 9;         // Distributed tracing ID
 } 
