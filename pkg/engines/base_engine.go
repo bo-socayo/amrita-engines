@@ -206,6 +206,13 @@ func (e *BaseEngine[TState, TEvent, TTransitionInfo]) GetEngineName() string {
 	return e.engineName
 }
 
+// CompressState provides default implementation that returns state unchanged.
+// Concrete engines can override this to optimize state before continue-as-new.
+func (e *BaseEngine[TState, TEvent, TTransitionInfo]) CompressState(ctx context.Context, currentState TState) (TState, error) {
+	// ✅ Default implementation: return state unchanged
+	return currentState, nil
+}
+
 // GetTransactionState returns the current transaction state.
 func (e *BaseEngine[TState, TEvent, TTransitionInfo]) GetTransactionState() TransactionState {
 	return e.baseEngineState.TransactionState

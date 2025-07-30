@@ -285,6 +285,20 @@ type Engine[TState, TEvent, TTransitionInfo proto.Message] interface {
 	// GetEngineName returns a string identifier for this engine.
 	GetEngineName() string
 
+	// CompressState allows engines to optimize/compress state before continue-as-new.
+	// This hook is called by the entity workflow before continuing as new, allowing
+	// engines to remove unnecessary data, compress collections, or archive old state.
+	//
+	// Args:
+	//   ctx: Context for cancellation
+	//   currentState: The current state to potentially compress
+	//
+	// Returns:
+	//   (compressedState, error) - optimized state for the new workflow
+	//   The default implementation should just return currentState unchanged.
+	//   Error types: ValidationError (if compression fails)
+	CompressState(ctx context.Context, currentState TState) (TState, error)
+
 	// Two-Phase Commit Protocol
 	// These methods support batch processing across multiple engines with transactional guarantees.
 

@@ -23,23 +23,23 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
-// EntityMetadata provides common context and metadata for all entities
+// EntityMetadata defines the identity and context of an entity workflow
+// This persists across all operations and continue-as-new cycles
 type EntityMetadata struct {
-	state          protoimpl.MessageState `protogen:"open.v1"`
-	EntityId       string                 `protobuf:"bytes,1,opt,name=entity_id,json=entityId,proto3" json:"entity_id,omitempty"`                    // UUID v4 format
-	OrgId          string                 `protobuf:"bytes,2,opt,name=org_id,json=orgId,proto3" json:"org_id,omitempty"`                             // Organization identifier
-	TeamId         string                 `protobuf:"bytes,3,opt,name=team_id,json=teamId,proto3" json:"team_id,omitempty"`                          // Team within organization
-	UserId         string                 `protobuf:"bytes,4,opt,name=user_id,json=userId,proto3" json:"user_id,omitempty"`                          // Acting user
-	Environment    string                 `protobuf:"bytes,5,opt,name=environment,proto3" json:"environment,omitempty"`                              // Environment
-	Tenant         string                 `protobuf:"bytes,6,opt,name=tenant,proto3" json:"tenant,omitempty"`                                        // Top-level tenant isolation
-	EntityType     string                 `protobuf:"bytes,7,opt,name=entity_type,json=entityType,proto3" json:"entity_type,omitempty"`              // Protobuf full URL
-	SignalType     string                 `protobuf:"bytes,8,opt,name=signal_type,json=signalType,proto3" json:"signal_type,omitempty"`              // Signal type name for searchability
-	SequenceNumber int64                  `protobuf:"varint,9,opt,name=sequence_number,json=sequenceNumber,proto3" json:"sequence_number,omitempty"` // Monotonic sequence number for ordering
-	CreatedAt      *timestamppb.Timestamp `protobuf:"bytes,10,opt,name=created_at,json=createdAt,proto3" json:"created_at,omitempty"`                // Entity creation timestamp
-	UpdatedAt      *timestamppb.Timestamp `protobuf:"bytes,11,opt,name=updated_at,json=updatedAt,proto3" json:"updated_at,omitempty"`                // Last update timestamp
-	Timestamp      *timestamppb.Timestamp `protobuf:"bytes,12,opt,name=timestamp,proto3" json:"timestamp,omitempty"`                                 // Current operation timestamp
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// 🔵 ENTITY IDENTITY (workflow-managed)
+	EntityId   string `protobuf:"bytes,1,opt,name=entity_id,json=entityId,proto3" json:"entity_id,omitempty"`       // UUID v4 format
+	EntityType string `protobuf:"bytes,2,opt,name=entity_type,json=entityType,proto3" json:"entity_type,omitempty"` // Protobuf full URL
+	// 🟢 AUTHORIZATION & TENANCY CONTEXT (set once at workflow start)
+	OrgId       string `protobuf:"bytes,3,opt,name=org_id,json=orgId,proto3" json:"org_id,omitempty"`    // Organization identifier
+	TeamId      string `protobuf:"bytes,4,opt,name=team_id,json=teamId,proto3" json:"team_id,omitempty"` // Team within organization
+	UserId      string `protobuf:"bytes,5,opt,name=user_id,json=userId,proto3" json:"user_id,omitempty"` // Acting user
+	Environment string `protobuf:"bytes,6,opt,name=environment,proto3" json:"environment,omitempty"`     // Environment
+	Tenant      string `protobuf:"bytes,7,opt,name=tenant,proto3" json:"tenant,omitempty"`               // Top-level tenant isolation
+	// 🟡 WORKFLOW METADATA (workflow-managed)
+	CreatedAt     *timestamppb.Timestamp `protobuf:"bytes,8,opt,name=created_at,json=createdAt,proto3" json:"created_at,omitempty"` // When entity workflow was first created
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *EntityMetadata) Reset() {
@@ -79,6 +79,13 @@ func (x *EntityMetadata) GetEntityId() string {
 	return ""
 }
 
+func (x *EntityMetadata) GetEntityType() string {
+	if x != nil {
+		return x.EntityType
+	}
+	return ""
+}
+
 func (x *EntityMetadata) GetOrgId() string {
 	if x != nil {
 		return x.OrgId
@@ -114,27 +121,6 @@ func (x *EntityMetadata) GetTenant() string {
 	return ""
 }
 
-func (x *EntityMetadata) GetEntityType() string {
-	if x != nil {
-		return x.EntityType
-	}
-	return ""
-}
-
-func (x *EntityMetadata) GetSignalType() string {
-	if x != nil {
-		return x.SignalType
-	}
-	return ""
-}
-
-func (x *EntityMetadata) GetSequenceNumber() int64 {
-	if x != nil {
-		return x.SequenceNumber
-	}
-	return 0
-}
-
 func (x *EntityMetadata) GetCreatedAt() *timestamppb.Timestamp {
 	if x != nil {
 		return x.CreatedAt
@@ -142,43 +128,138 @@ func (x *EntityMetadata) GetCreatedAt() *timestamppb.Timestamp {
 	return nil
 }
 
-func (x *EntityMetadata) GetUpdatedAt() *timestamppb.Timestamp {
+// RequestContext contains per-operation/per-request specific data
+// This is provided fresh with each update/signal by the client
+type RequestContext struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// 🔐 AUTHORIZATION (per-request - eventually from JWT)
+	OrgId       string `protobuf:"bytes,1,opt,name=org_id,json=orgId,proto3" json:"org_id,omitempty"`    // Organization making the request
+	UserId      string `protobuf:"bytes,2,opt,name=user_id,json=userId,proto3" json:"user_id,omitempty"` // User making the request
+	Tenant      string `protobuf:"bytes,3,opt,name=tenant,proto3" json:"tenant,omitempty"`               // Tenant context
+	Environment string `protobuf:"bytes,4,opt,name=environment,proto3" json:"environment,omitempty"`     // Environment
+	// 🆔 REQUEST IDENTITY & DEDUPLICATION
+	IdempotencyKey string                 `protobuf:"bytes,5,opt,name=idempotency_key,json=idempotencyKey,proto3" json:"idempotency_key,omitempty"` // Client-provided idempotency key
+	RequestTime    *timestamppb.Timestamp `protobuf:"bytes,6,opt,name=request_time,json=requestTime,proto3" json:"request_time,omitempty"`          // When this specific request was made
+	// 📊 OBSERVABILITY (optional)
+	RequestId     string `protobuf:"bytes,7,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"` // Request tracing ID
+	TraceId       string `protobuf:"bytes,8,opt,name=trace_id,json=traceId,proto3" json:"trace_id,omitempty"`       // Distributed tracing ID
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RequestContext) Reset() {
+	*x = RequestContext{}
+	mi := &file_entity_v1_metadata_proto_msgTypes[1]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RequestContext) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RequestContext) ProtoMessage() {}
+
+func (x *RequestContext) ProtoReflect() protoreflect.Message {
+	mi := &file_entity_v1_metadata_proto_msgTypes[1]
 	if x != nil {
-		return x.UpdatedAt
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RequestContext.ProtoReflect.Descriptor instead.
+func (*RequestContext) Descriptor() ([]byte, []int) {
+	return file_entity_v1_metadata_proto_rawDescGZIP(), []int{1}
+}
+
+func (x *RequestContext) GetOrgId() string {
+	if x != nil {
+		return x.OrgId
+	}
+	return ""
+}
+
+func (x *RequestContext) GetUserId() string {
+	if x != nil {
+		return x.UserId
+	}
+	return ""
+}
+
+func (x *RequestContext) GetTenant() string {
+	if x != nil {
+		return x.Tenant
+	}
+	return ""
+}
+
+func (x *RequestContext) GetEnvironment() string {
+	if x != nil {
+		return x.Environment
+	}
+	return ""
+}
+
+func (x *RequestContext) GetIdempotencyKey() string {
+	if x != nil {
+		return x.IdempotencyKey
+	}
+	return ""
+}
+
+func (x *RequestContext) GetRequestTime() *timestamppb.Timestamp {
+	if x != nil {
+		return x.RequestTime
 	}
 	return nil
 }
 
-func (x *EntityMetadata) GetTimestamp() *timestamppb.Timestamp {
+func (x *RequestContext) GetRequestId() string {
 	if x != nil {
-		return x.Timestamp
+		return x.RequestId
 	}
-	return nil
+	return ""
+}
+
+func (x *RequestContext) GetTraceId() string {
+	if x != nil {
+		return x.TraceId
+	}
+	return ""
 }
 
 var File_entity_v1_metadata_proto protoreflect.FileDescriptor
 
 const file_entity_v1_metadata_proto_rawDesc = "" +
 	"\n" +
-	"\x18entity/v1/metadata.proto\x12\tentity.v1\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\x1bbuf/validate/validate.proto\"\xe3\x04\n" +
+	"\x18entity/v1/metadata.proto\x12\tentity.v1\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\x1bbuf/validate/validate.proto\"\x92\x03\n" +
 	"\x0eEntityMetadata\x12b\n" +
-	"\tentity_id\x18\x01 \x01(\tBE\xbaHBr@2>^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$R\bentityId\x12\x1e\n" +
-	"\x06org_id\x18\x02 \x01(\tB\a\xbaH\x04r\x02\x10\x01R\x05orgId\x12\x17\n" +
-	"\ateam_id\x18\x03 \x01(\tR\x06teamId\x12 \n" +
-	"\auser_id\x18\x04 \x01(\tB\a\xbaH\x04r\x02\x10\x01R\x06userId\x12;\n" +
-	"\venvironment\x18\x05 \x01(\tB\x19\xbaH\x16r\x14R\x03devR\astagingR\x04prodR\venvironment\x12\x1f\n" +
-	"\x06tenant\x18\x06 \x01(\tB\a\xbaH\x04r\x02\x10\x01R\x06tenant\x12(\n" +
-	"\ventity_type\x18\a \x01(\tB\a\xbaH\x04r\x02\x10\x01R\n" +
-	"entityType\x12(\n" +
-	"\vsignal_type\x18\b \x01(\tB\a\xbaH\x04r\x02\x10\x01R\n" +
-	"signalType\x120\n" +
-	"\x0fsequence_number\x18\t \x01(\x03B\a\xbaH\x04\"\x02(\x00R\x0esequenceNumber\x129\n" +
+	"\tentity_id\x18\x01 \x01(\tBE\xbaHBr@2>^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$R\bentityId\x12(\n" +
+	"\ventity_type\x18\x02 \x01(\tB\a\xbaH\x04r\x02\x10\x01R\n" +
+	"entityType\x12\x1e\n" +
+	"\x06org_id\x18\x03 \x01(\tB\a\xbaH\x04r\x02\x10\x01R\x05orgId\x12\x17\n" +
+	"\ateam_id\x18\x04 \x01(\tR\x06teamId\x12 \n" +
+	"\auser_id\x18\x05 \x01(\tB\a\xbaH\x04r\x02\x10\x01R\x06userId\x12;\n" +
+	"\venvironment\x18\x06 \x01(\tB\x19\xbaH\x16r\x14R\x03devR\astagingR\x04prodR\venvironment\x12\x1f\n" +
+	"\x06tenant\x18\a \x01(\tB\a\xbaH\x04r\x02\x10\x01R\x06tenant\x129\n" +
 	"\n" +
-	"created_at\x18\n" +
-	" \x01(\v2\x1a.google.protobuf.TimestampR\tcreatedAt\x129\n" +
+	"created_at\x18\b \x01(\v2\x1a.google.protobuf.TimestampR\tcreatedAt\"\xde\x02\n" +
+	"\x0eRequestContext\x12\x1e\n" +
+	"\x06org_id\x18\x01 \x01(\tB\a\xbaH\x04r\x02\x10\x01R\x05orgId\x12 \n" +
+	"\auser_id\x18\x02 \x01(\tB\a\xbaH\x04r\x02\x10\x01R\x06userId\x12\x1f\n" +
+	"\x06tenant\x18\x03 \x01(\tB\a\xbaH\x04r\x02\x10\x01R\x06tenant\x12;\n" +
+	"\venvironment\x18\x04 \x01(\tB\x19\xbaH\x16r\x14R\x03devR\astagingR\x04prodR\venvironment\x123\n" +
+	"\x0fidempotency_key\x18\x05 \x01(\tB\n" +
+	"\xbaH\ar\x05\x10\x01\x18\xff\x01R\x0eidempotencyKey\x12=\n" +
+	"\frequest_time\x18\x06 \x01(\v2\x1a.google.protobuf.TimestampR\vrequestTime\x12\x1d\n" +
 	"\n" +
-	"updated_at\x18\v \x01(\v2\x1a.google.protobuf.TimestampR\tupdatedAt\x128\n" +
-	"\ttimestamp\x18\f \x01(\v2\x1a.google.protobuf.TimestampR\ttimestampB\x8c\x01\n" +
+	"request_id\x18\a \x01(\tR\trequestId\x12\x19\n" +
+	"\btrace_id\x18\b \x01(\tR\atraceIdB\x8c\x01\n" +
 	"\rcom.entity.v1B\rMetadataProtoP\x01Z'entity-workflows/gen/entity/v1;entityv1\xa2\x02\x03EXX\xaa\x02\tEntity.V1\xca\x02\tEntity\\V1\xe2\x02\x15Entity\\V1\\GPBMetadata\xea\x02\n" +
 	"Entity::V1b\x06proto3"
 
@@ -194,20 +275,20 @@ func file_entity_v1_metadata_proto_rawDescGZIP() []byte {
 	return file_entity_v1_metadata_proto_rawDescData
 }
 
-var file_entity_v1_metadata_proto_msgTypes = make([]protoimpl.MessageInfo, 1)
+var file_entity_v1_metadata_proto_msgTypes = make([]protoimpl.MessageInfo, 2)
 var file_entity_v1_metadata_proto_goTypes = []any{
 	(*EntityMetadata)(nil),        // 0: entity.v1.EntityMetadata
-	(*timestamppb.Timestamp)(nil), // 1: google.protobuf.Timestamp
+	(*RequestContext)(nil),        // 1: entity.v1.RequestContext
+	(*timestamppb.Timestamp)(nil), // 2: google.protobuf.Timestamp
 }
 var file_entity_v1_metadata_proto_depIdxs = []int32{
-	1, // 0: entity.v1.EntityMetadata.created_at:type_name -> google.protobuf.Timestamp
-	1, // 1: entity.v1.EntityMetadata.updated_at:type_name -> google.protobuf.Timestamp
-	1, // 2: entity.v1.EntityMetadata.timestamp:type_name -> google.protobuf.Timestamp
-	3, // [3:3] is the sub-list for method output_type
-	3, // [3:3] is the sub-list for method input_type
-	3, // [3:3] is the sub-list for extension type_name
-	3, // [3:3] is the sub-list for extension extendee
-	0, // [0:3] is the sub-list for field type_name
+	2, // 0: entity.v1.EntityMetadata.created_at:type_name -> google.protobuf.Timestamp
+	2, // 1: entity.v1.RequestContext.request_time:type_name -> google.protobuf.Timestamp
+	2, // [2:2] is the sub-list for method output_type
+	2, // [2:2] is the sub-list for method input_type
+	2, // [2:2] is the sub-list for extension type_name
+	2, // [2:2] is the sub-list for extension extendee
+	0, // [0:2] is the sub-list for field type_name
 }
 
 func init() { file_entity_v1_metadata_proto_init() }
@@ -221,7 +302,7 @@ func file_entity_v1_metadata_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_entity_v1_metadata_proto_rawDesc), len(file_entity_v1_metadata_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   1,
+			NumMessages:   2,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

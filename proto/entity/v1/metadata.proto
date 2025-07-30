@@ -7,18 +7,38 @@ option go_package = "entity-workflows/gen/entity/v1;entityv1";
 import "google/protobuf/timestamp.proto";
 import "buf/validate/validate.proto";
 
-// EntityMetadata provides common context and metadata for all entities
+// EntityMetadata defines the identity and context of an entity workflow  
+// This persists across all operations and continue-as-new cycles
 message EntityMetadata {
+  // 🔵 ENTITY IDENTITY (workflow-managed)
   string entity_id = 1 [(buf.validate.field).string.pattern = "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"]; // UUID v4 format
-  string org_id = 2 [(buf.validate.field).string.min_len = 1];        // Organization identifier
-  string team_id = 3;                                                 // Team within organization  
-  string user_id = 4 [(buf.validate.field).string.min_len = 1];       // Acting user
-  string environment = 5 [(buf.validate.field).string = {in: ["dev", "staging", "prod"]}]; // Environment
-  string tenant = 6 [(buf.validate.field).string.min_len = 1];        // Top-level tenant isolation
-  string entity_type = 7 [(buf.validate.field).string.min_len = 1];   // Protobuf full URL
-  string signal_type = 8 [(buf.validate.field).string.min_len = 1];   // Signal type name for searchability
-  int64 sequence_number = 9 [(buf.validate.field).int64.gte = 0];      // Monotonic sequence number for ordering
-  google.protobuf.Timestamp created_at = 10;                          // Entity creation timestamp
-  google.protobuf.Timestamp updated_at = 11;                          // Last update timestamp
-  google.protobuf.Timestamp timestamp = 12;                           // Current operation timestamp
+  string entity_type = 2 [(buf.validate.field).string.min_len = 1];   // Protobuf full URL
+  
+  // 🟢 AUTHORIZATION & TENANCY CONTEXT (set once at workflow start)
+  string org_id = 3 [(buf.validate.field).string.min_len = 1];        // Organization identifier
+  string team_id = 4;                                                 // Team within organization  
+  string user_id = 5 [(buf.validate.field).string.min_len = 1];       // Acting user
+  string environment = 6 [(buf.validate.field).string = {in: ["dev", "staging", "prod"]}]; // Environment
+  string tenant = 7 [(buf.validate.field).string.min_len = 1];        // Top-level tenant isolation
+  
+  // 🟡 WORKFLOW METADATA (workflow-managed)
+  google.protobuf.Timestamp created_at = 8;                           // When entity workflow was first created
+}
+
+// RequestContext contains per-operation/per-request specific data
+// This is provided fresh with each update/signal by the client
+message RequestContext {
+  // 🔐 AUTHORIZATION (per-request - eventually from JWT)
+  string org_id = 1 [(buf.validate.field).string.min_len = 1];        // Organization making the request
+  string user_id = 2 [(buf.validate.field).string.min_len = 1];       // User making the request  
+  string tenant = 3 [(buf.validate.field).string.min_len = 1];        // Tenant context
+  string environment = 4 [(buf.validate.field).string = {in: ["dev", "staging", "prod"]}]; // Environment
+  
+  // 🆔 REQUEST IDENTITY & DEDUPLICATION
+  string idempotency_key = 5 [(buf.validate.field).string.min_len = 1, (buf.validate.field).string.max_len = 255]; // Client-provided idempotency key
+  google.protobuf.Timestamp request_time = 6;                         // When this specific request was made
+  
+  // 📊 OBSERVABILITY (optional)
+  string request_id = 7;       // Request tracing ID
+  string trace_id = 8;         // Distributed tracing ID
 } 
