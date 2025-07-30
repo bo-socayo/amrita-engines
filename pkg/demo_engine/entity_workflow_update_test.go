@@ -1,34 +1,84 @@
 package demo_engine
 
 import (
+	"context"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/suite"
+	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/testsuite"
+	"go.temporal.io/sdk/worker"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/bo-socayo/amrita-engines/pkg/entityworkflows"
-	basev1 "github.com/bo-socayo/amrita-engines/gen/engines/base/v1"
 	demov1 "github.com/bo-socayo/amrita-engines/gen/engines/demo/v1"
 	entityv1 "github.com/bo-socayo/amrita-engines/gen/entity/v1"
 )
 
 type DemoEntityWorkflowUpdateTestSuite struct {
 	suite.Suite
-	testsuite.WorkflowTestSuite
-	env *testsuite.TestWorkflowEnvironment
+	
+	// Use in-memory dev server
+	devServer  *testsuite.DevServer
+	client     client.Client
+	worker     worker.Worker
+	taskQueue  string
+}
+
+func (s *DemoEntityWorkflowUpdateTestSuite) SetupSuite() {
+	// Start in-memory dev server
+	var err error
+	s.devServer, err = testsuite.StartDevServer(context.Background(), testsuite.DevServerOptions{
+		ClientOptions: &client.Options{},
+	})
+	s.Require().NoError(err)
+	s.Require().NotNil(s.devServer)
+	
+	// Get client from dev server
+	s.client = s.devServer.Client()
+	s.Require().NotNil(s.client)
+	
+	// Create unique task queue for this test suite
+	s.taskQueue = "demo-entity-update-suite-" + time.Now().Format("20060102-150405")
+	
+	// Create worker (shared across all tests in suite)
+	s.worker = worker.New(s.client, s.taskQueue, worker.Options{})
+	
+	// Register the entity workflow - it comes with activities built-in now!
+	s.worker.RegisterWorkflow(DemoEntityWorkflow)
+	
+	// Start worker once for the entire suite
+	go func() {
+		err := s.worker.Run(make(chan interface{}))
+		if err != nil {
+			s.T().Logf("Worker error: %v", err)
+		}
+	}()
+	
+	// Give worker a moment to start
+	time.Sleep(200 * time.Millisecond)
+	
+	s.T().Log("✅ Started in-memory Temporal dev server for update tests")
+}
+
+func (s *DemoEntityWorkflowUpdateTestSuite) TearDownSuite() {
+	if s.worker != nil {
+		s.worker.Stop()
+	}
+	if s.devServer != nil {
+		err := s.devServer.Stop()
+		s.Require().NoError(err)
+		s.T().Log("✅ Stopped in-memory Temporal dev server")
+	}
 }
 
 func (s *DemoEntityWorkflowUpdateTestSuite) SetupTest() {
-	s.env = s.NewTestWorkflowEnvironment()
-	
-	// Register the entity workflow
-	s.env.RegisterWorkflow(DemoEntityWorkflow)
+	// No per-test setup needed
 }
 
 func (s *DemoEntityWorkflowUpdateTestSuite) TearDownTest() {
-	s.env.AssertExpectations(s.T())
+	// No per-test cleanup needed
 }
 
 func TestDemoEntityWorkflowUpdateTestSuite(t *testing.T) {
@@ -57,50 +107,67 @@ func (s *DemoEntityWorkflowUpdateTestSuite) Test_UpdateProcessEvent_IncrementSuc
 	}
 
 	// Start the workflow
-	s.env.ExecuteWorkflow(DemoEntityWorkflow, params)
+	s.T().Log("🚀 Starting workflow for increment update test")
+	workflowRun, err := s.client.ExecuteWorkflow(context.Background(), client.StartWorkflowOptions{
+		ID:        "test-increment-update-workflow-" + time.Now().Format("20060102-150405-000"),
+		TaskQueue: s.taskQueue,
+	}, DemoEntityWorkflow, params)
+	s.Require().NoError(err)
+	s.T().Log("📋 Workflow started")
 
-	// Wait for workflow to initialize then send update
+	// Give workflow a moment to initialize
+	time.Sleep(300 * time.Millisecond)
+
+	// Create increment signal
+	incrementSignal := &demov1.DemoEngineSignal{
+		Signal: &demov1.DemoEngineSignal_Increment{
+			Increment: &demov1.IncrementSignal{
+				Amount:    5,
+				Reason:    "Test increment via update",
+				Timestamp: timestamppb.Now(),
+			},
+		},
+	}
+
+	// Create request context for the update
+	requestCtx := &entityv1.RequestContext{
+		UserId:         "test-user",
+		OrgId:          "test-org",
+		TeamId:         "test-team",
+		Environment:    "test",
+		Tenant:         "test-tenant",
+		IdempotencyKey: "update-increment-1",
+		RequestTime:    timestamppb.Now(),
+	}
+
+	// Send update to the running workflow
+	s.T().Log("⏰ Sending increment update via processEvent")
+	updateHandle, err := s.client.UpdateWorkflow(context.Background(), client.UpdateWorkflowOptions{
+		WorkflowID:   workflowRun.GetID(),
+		RunID:        workflowRun.GetRunID(),
+		UpdateName:   "processEvent",
+		WaitForStage: client.WorkflowUpdateStageCompleted,
+		Args:         []interface{}{requestCtx, incrementSignal},
+	})
+	s.Require().NoError(err)
+	
+	// Get the update result with timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	
 	var updateResult *demov1.DemoEngineState
-	s.env.RegisterDelayedCallback(func() {
-		// Create increment signal
-		incrementSignal := &demov1.DemoEngineSignal{
-			Signal: &demov1.DemoEngineSignal_Increment{
-				Increment: &demov1.IncrementSignal{
-					Amount:    5,
-					Reason:    "Test increment via update",
-					Timestamp: timestamppb.Now(),
-				},
-			},
-		}
-
-		// Create request context for the update
-		requestCtx := &entityv1.RequestContext{
-			UserId:         "test-user",
-			OrgId:          "test-org",
-			IdempotencyKey: "update-increment-1",
-			RequestTime:    timestamppb.Now(),
-		}
-
-		// Send update and capture result
-		s.env.UpdateWorkflow("processEvent", "increment-update-1", &testsuite.TestUpdateCallback{
-			OnAccept: func() {
-				// Update was accepted by validator
-			},
-			OnReject: func(err error) {
-				s.Fail("Update should not be rejected", err)
-			},
-			OnComplete: func(response interface{}, err error) {
-				s.NoError(err)
-				updateResult = response.(*demov1.DemoEngineState)
-				s.Equal(int64(5), updateResult.CurrentValue)
-				s.Len(updateResult.History, 1)
-				s.Equal("Test increment via update", updateResult.History[0].Reason)
-				s.Equal(demov1.CounterEventType_COUNTER_EVENT_TYPE_INCREMENT, updateResult.History[0].Type)
-			},
-		}, requestCtx, incrementSignal)
-	}, time.Millisecond*100)
-
-	// Entity workflows are long-running and don't complete naturally
+	err = updateHandle.Get(ctx, &updateResult)
+	s.Require().NoError(err)
+	s.T().Log("🎯 Increment update completed successfully!")
+	
+	// Verify the update worked
+	s.NotNil(updateResult)
+	s.Equal(int64(5), updateResult.CurrentValue)
+	s.Len(updateResult.History, 1)
+	s.Equal("Test increment via update", updateResult.History[0].Reason)
+	s.Equal(demov1.CounterEventType_COUNTER_EVENT_TYPE_INCREMENT, updateResult.History[0].Type)
+	
+	s.T().Log("✅ Increment update test completed successfully!")
 }
 
 func (s *DemoEntityWorkflowUpdateTestSuite) Test_UpdateProcessEvent_ResetSuccess() {
@@ -123,40 +190,66 @@ func (s *DemoEntityWorkflowUpdateTestSuite) Test_UpdateProcessEvent_ResetSuccess
 		InitialState: initialState,
 	}
 
-	s.env.ExecuteWorkflow(DemoEntityWorkflow, params)
+	// Start the workflow
+	s.T().Log("🚀 Starting workflow for reset update test")
+	workflowRun, err := s.client.ExecuteWorkflow(context.Background(), client.StartWorkflowOptions{
+		ID:        "test-reset-update-workflow-" + time.Now().Format("20060102-150405-000"),
+		TaskQueue: s.taskQueue,
+	}, DemoEntityWorkflow, params)
+	s.Require().NoError(err)
+	s.T().Log("📋 Workflow started")
 
-	// Send reset update
+	// Give workflow a moment to initialize
+	time.Sleep(300 * time.Millisecond)
+
+	// Create reset signal
+	resetSignal := &demov1.DemoEngineSignal{
+		Signal: &demov1.DemoEngineSignal_Reset_{
+			Reset_: &demov1.ResetSignal{
+				Reason:    "Test reset via update",
+				Timestamp: timestamppb.Now(),
+			},
+		},
+	}
+
+	requestCtx := &entityv1.RequestContext{
+		UserId:         "test-user",
+		OrgId:          "test-org",
+		TeamId:         "test-team",
+		Environment:    "test",
+		Tenant:         "test-tenant",
+		IdempotencyKey: "update-reset-1",
+		RequestTime:    timestamppb.Now(),
+	}
+
+	// Send update to the running workflow
+	s.T().Log("⏰ Sending reset update via processEvent")
+	updateHandle, err := s.client.UpdateWorkflow(context.Background(), client.UpdateWorkflowOptions{
+		WorkflowID:   workflowRun.GetID(),
+		RunID:        workflowRun.GetRunID(),
+		UpdateName:   "processEvent",
+		WaitForStage: client.WorkflowUpdateStageCompleted,
+		Args:         []interface{}{requestCtx, resetSignal},
+	})
+	s.Require().NoError(err)
+	
+	// Get the update result with timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	
 	var updateResult *demov1.DemoEngineState
-	s.env.RegisterDelayedCallback(func() {
-		resetSignal := &demov1.DemoEngineSignal{
-			Signal: &demov1.DemoEngineSignal_Reset_{
-				Reset_: &demov1.ResetSignal{
-					Reason:    "Test reset via update",
-					Timestamp: timestamppb.Now(),
-				},
-			},
-		}
-
-		requestCtx := &entityv1.RequestContext{
-			UserId:         "test-user",
-			OrgId:          "test-org",
-			IdempotencyKey: "update-reset-1",
-			RequestTime:    timestamppb.Now(),
-		}
-
-		s.env.UpdateWorkflow("processEvent", "reset-update-1", &testsuite.TestUpdateCallback{
-			OnComplete: func(response interface{}, err error) {
-				s.NoError(err)
-				updateResult = response.(*demov1.DemoEngineState)
-				s.Equal(int64(0), updateResult.CurrentValue)
-				s.Len(updateResult.History, 1)
-				s.Equal("Test reset via update", updateResult.History[0].Reason)
-				s.Equal(demov1.CounterEventType_COUNTER_EVENT_TYPE_RESET, updateResult.History[0].Type)
-			},
-		}, requestCtx, resetSignal)
-	}, time.Millisecond*100)
-
-	// Entity workflows are long-running and don't complete naturally
+	err = updateHandle.Get(ctx, &updateResult)
+	s.Require().NoError(err)
+	s.T().Log("🎯 Reset update completed successfully!")
+	
+	// Verify the reset worked
+	s.NotNil(updateResult)
+	s.Equal(int64(0), updateResult.CurrentValue)
+	s.Len(updateResult.History, 1)
+	s.Equal("Test reset via update", updateResult.History[0].Reason)
+	s.Equal(demov1.CounterEventType_COUNTER_EVENT_TYPE_RESET, updateResult.History[0].Type)
+	
+	s.T().Log("✅ Reset update test completed successfully!")
 }
 
 func (s *DemoEntityWorkflowUpdateTestSuite) Test_UpdateProcessEvent_ConfigUpdate() {
@@ -178,50 +271,76 @@ func (s *DemoEntityWorkflowUpdateTestSuite) Test_UpdateProcessEvent_ConfigUpdate
 		InitialState: initialState,
 	}
 
-	s.env.ExecuteWorkflow(DemoEntityWorkflow, params)
+	// Start the workflow
+	s.T().Log("🚀 Starting workflow for config update test")
+	workflowRun, err := s.client.ExecuteWorkflow(context.Background(), client.StartWorkflowOptions{
+		ID:        "test-config-update-workflow-" + time.Now().Format("20060102-150405-000"),
+		TaskQueue: s.taskQueue,
+	}, DemoEntityWorkflow, params)
+	s.Require().NoError(err)
+	s.T().Log("📋 Workflow started")
 
-	// Send config update
+	// Give workflow a moment to initialize
+	time.Sleep(300 * time.Millisecond)
+
+	// Create config update signal
+	newConfig := &demov1.DemoConfig{
+		MaxValue:         200,
+		DefaultIncrement: 5,
+		AllowNegative:    true,
+		Description:      "Updated config via update handler",
+	}
+
+	configUpdateSignal := &demov1.DemoEngineSignal{
+		Signal: &demov1.DemoEngineSignal_UpdateConfig{
+			UpdateConfig: &demov1.UpdateConfigSignal{
+				Config:    newConfig,
+				Reason:    "Test config update",
+				Timestamp: timestamppb.Now(),
+			},
+		},
+	}
+
+	requestCtx := &entityv1.RequestContext{
+		UserId:         "test-user",
+		OrgId:          "test-org",
+		TeamId:         "test-team",
+		Environment:    "test",
+		Tenant:         "test-tenant",
+		IdempotencyKey: "update-config-1",
+		RequestTime:    timestamppb.Now(),
+	}
+
+	// Send update to the running workflow
+	s.T().Log("⏰ Sending config update via processEvent")
+	updateHandle, err := s.client.UpdateWorkflow(context.Background(), client.UpdateWorkflowOptions{
+		WorkflowID:   workflowRun.GetID(),
+		RunID:        workflowRun.GetRunID(),
+		UpdateName:   "processEvent",
+		WaitForStage: client.WorkflowUpdateStageCompleted,
+		Args:         []interface{}{requestCtx, configUpdateSignal},
+	})
+	s.Require().NoError(err)
+	
+	// Get the update result with timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	
 	var updateResult *demov1.DemoEngineState
-	s.env.RegisterDelayedCallback(func() {
-		newConfig := &demov1.DemoConfig{
-			MaxValue:         200,
-			DefaultIncrement: 5,
-			AllowNegative:    true,
-			Description:      "Updated config via update handler",
-		}
-
-		configUpdateSignal := &demov1.DemoEngineSignal{
-			Signal: &demov1.DemoEngineSignal_UpdateConfig{
-				UpdateConfig: &demov1.UpdateConfigSignal{
-					Config:    newConfig,
-					Reason:    "Test config update",
-					Timestamp: timestamppb.Now(),
-				},
-			},
-		}
-
-		requestCtx := &entityv1.RequestContext{
-			UserId:         "test-user",
-			OrgId:          "test-org",
-			IdempotencyKey: "update-config-1",
-			RequestTime:    timestamppb.Now(),
-		}
-
-		s.env.UpdateWorkflow("processEvent", "config-update-1", &testsuite.TestUpdateCallback{
-			OnComplete: func(response interface{}, err error) {
-				s.NoError(err)
-				updateResult = response.(*demov1.DemoEngineState)
-				s.Equal(int64(200), updateResult.Config.MaxValue)
-				s.Equal(int64(5), updateResult.Config.DefaultIncrement)
-				s.True(updateResult.Config.AllowNegative)
-				s.Equal("Updated config via update handler", updateResult.Config.Description)
-				s.Len(updateResult.History, 1)
-				s.Equal(demov1.CounterEventType_COUNTER_EVENT_TYPE_CONFIG_UPDATE, updateResult.History[0].Type)
-			},
-		}, requestCtx, configUpdateSignal)
-	}, time.Millisecond*100)
-
-	// Entity workflows are long-running and don't complete naturally
+	err = updateHandle.Get(ctx, &updateResult)
+	s.Require().NoError(err)
+	s.T().Log("🎯 Config update completed successfully!")
+	
+	// Verify the config update worked
+	s.NotNil(updateResult)
+	s.Equal(int64(200), updateResult.Config.MaxValue)
+	s.Equal(int64(5), updateResult.Config.DefaultIncrement)
+	s.True(updateResult.Config.AllowNegative)
+	s.Equal("Updated config via update handler", updateResult.Config.Description)
+	s.Len(updateResult.History, 1)
+	s.Equal(demov1.CounterEventType_COUNTER_EVENT_TYPE_CONFIG_UPDATE, updateResult.History[0].Type)
+	
+	s.T().Log("✅ Config update test completed successfully!")
 }
 
 func (s *DemoEntityWorkflowUpdateTestSuite) Test_UpdateProcessEvent_IdempotencyHandling() {
@@ -243,7 +362,17 @@ func (s *DemoEntityWorkflowUpdateTestSuite) Test_UpdateProcessEvent_IdempotencyH
 		InitialState: initialState,
 	}
 
-	s.env.ExecuteWorkflow(DemoEntityWorkflow, params)
+	// Start the workflow
+	s.T().Log("🚀 Starting workflow for idempotency test")
+	workflowRun, err := s.client.ExecuteWorkflow(context.Background(), client.StartWorkflowOptions{
+		ID:        "test-idempotency-workflow-" + time.Now().Format("20060102-150405-000"),
+		TaskQueue: s.taskQueue,
+	}, DemoEntityWorkflow, params)
+	s.Require().NoError(err)
+	s.T().Log("📋 Workflow started")
+
+	// Give workflow a moment to initialize
+	time.Sleep(300 * time.Millisecond)
 
 	incrementSignal := &demov1.DemoEngineSignal{
 		Signal: &demov1.DemoEngineSignal_Increment{
@@ -258,38 +387,59 @@ func (s *DemoEntityWorkflowUpdateTestSuite) Test_UpdateProcessEvent_IdempotencyH
 	requestCtx := &entityv1.RequestContext{
 		UserId:         "test-user",
 		OrgId:          "test-org",
+		TeamId:         "test-team",
+		Environment:    "test",
+		Tenant:         "test-tenant",
 		IdempotencyKey: "same-idempotency-key", // Same key for both updates
 		RequestTime:    timestamppb.Now(),
 	}
 
-	var firstResult, secondResult *demov1.DemoEngineState
-
 	// First update with idempotency key
-	s.env.RegisterDelayedCallback(func() {
-		s.env.UpdateWorkflow("processEvent", "first-update", &testsuite.TestUpdateCallback{
-			OnComplete: func(response interface{}, err error) {
-				s.NoError(err)
-				firstResult = response.(*demov1.DemoEngineState)
-				s.Equal(int64(5), firstResult.CurrentValue)
-				s.Len(firstResult.History, 1)
-			},
-		}, requestCtx, incrementSignal)
-	}, time.Millisecond*100)
+	s.T().Log("⏰ Sending first update with idempotency key")
+	updateHandle1, err := s.client.UpdateWorkflow(context.Background(), client.UpdateWorkflowOptions{
+		WorkflowID:   workflowRun.GetID(),
+		RunID:        workflowRun.GetRunID(),
+		UpdateName:   "processEvent",
+		WaitForStage: client.WorkflowUpdateStageCompleted,
+		Args:         []interface{}{requestCtx, incrementSignal},
+	})
+	s.Require().NoError(err)
+	
+	ctx1, cancel1 := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel1()
+	
+	var firstResult *demov1.DemoEngineState
+	err = updateHandle1.Get(ctx1, &firstResult)
+	s.Require().NoError(err)
+	s.T().Log("🎯 First update completed!")
+	
+	s.Equal(int64(5), firstResult.CurrentValue)
+	s.Len(firstResult.History, 1)
 
 	// Second update with same idempotency key (should be deduplicated)
-	s.env.RegisterDelayedCallback(func() {
-		s.env.UpdateWorkflow("processEvent", "second-update", &testsuite.TestUpdateCallback{
-			OnComplete: func(response interface{}, err error) {
-				s.NoError(err)
-				secondResult = response.(*demov1.DemoEngineState)
-				// Should return same state, not increment again
-				s.Equal(int64(5), secondResult.CurrentValue)
-				s.Len(secondResult.History, 1) // Still only one event
-			},
-		}, requestCtx, incrementSignal)
-	}, time.Millisecond*200)
-
-	// Entity workflows are long-running and don't complete naturally
+	s.T().Log("⏰ Sending second update with same idempotency key (should be deduplicated)")
+	updateHandle2, err := s.client.UpdateWorkflow(context.Background(), client.UpdateWorkflowOptions{
+		WorkflowID:   workflowRun.GetID(),
+		RunID:        workflowRun.GetRunID(),
+		UpdateName:   "processEvent",
+		WaitForStage: client.WorkflowUpdateStageCompleted,
+		Args:         []interface{}{requestCtx, incrementSignal},
+	})
+	s.Require().NoError(err)
+	
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel2()
+	
+	var secondResult *demov1.DemoEngineState
+	err = updateHandle2.Get(ctx2, &secondResult)
+	s.Require().NoError(err)
+	s.T().Log("🎯 Second update completed (should be deduplicated)!")
+	
+	// Should return same state, not increment again
+	s.Equal(int64(5), secondResult.CurrentValue)
+	s.Len(secondResult.History, 1) // Still only one event
+	
+	s.T().Log("✅ Idempotency test completed successfully!")
 }
 
 func (s *DemoEntityWorkflowUpdateTestSuite) Test_UpdateProcessEvent_MultipleUpdatesSequential() {
@@ -311,98 +461,147 @@ func (s *DemoEntityWorkflowUpdateTestSuite) Test_UpdateProcessEvent_MultipleUpda
 		InitialState: initialState,
 	}
 
-	s.env.ExecuteWorkflow(DemoEntityWorkflow, params)
+	// Start the workflow
+	s.T().Log("🚀 Starting workflow for multiple sequential updates test")
+	workflowRun, err := s.client.ExecuteWorkflow(context.Background(), client.StartWorkflowOptions{
+		ID:        "test-multi-updates-workflow-" + time.Now().Format("20060102-150405-000"),
+		TaskQueue: s.taskQueue,
+	}, DemoEntityWorkflow, params)
+	s.Require().NoError(err)
+	s.T().Log("📋 Workflow started")
+
+	// Give workflow a moment to initialize
+	time.Sleep(300 * time.Millisecond)
 
 	// First update: Increment by 3
-	s.env.RegisterDelayedCallback(func() {
-		incrementSignal := &demov1.DemoEngineSignal{
-			Signal: &demov1.DemoEngineSignal_Increment{
-				Increment: &demov1.IncrementSignal{
-					Amount:    3,
-					Reason:    "First increment",
-					Timestamp: timestamppb.Now(),
-				},
+	incrementSignal1 := &demov1.DemoEngineSignal{
+		Signal: &demov1.DemoEngineSignal_Increment{
+			Increment: &demov1.IncrementSignal{
+				Amount:    3,
+				Reason:    "First increment",
+				Timestamp: timestamppb.Now(),
 			},
-		}
+		},
+	}
 
-		requestCtx := &entityv1.RequestContext{
-			UserId:         "test-user",
-			OrgId:          "test-org",
-			IdempotencyKey: "update-1",
-			RequestTime:    timestamppb.Now(),
-		}
+	requestCtx1 := &entityv1.RequestContext{
+		UserId:         "test-user",
+		OrgId:          "test-org",
+		TeamId:         "test-team",
+		Environment:    "test",
+		Tenant:         "test-tenant",
+		IdempotencyKey: "update-1",
+		RequestTime:    timestamppb.Now(),
+	}
 
-		s.env.UpdateWorkflow("processEvent", "multi-update-1", &testsuite.TestUpdateCallback{
-			OnComplete: func(response interface{}, err error) {
-				s.NoError(err)
-				result := response.(*demov1.DemoEngineState)
-				s.Equal(int64(3), result.CurrentValue)
-				s.Len(result.History, 1)
-			},
-		}, requestCtx, incrementSignal)
-	}, time.Millisecond*100)
+	s.T().Log("⏰ Sending first increment (3)")
+	updateHandle1, err := s.client.UpdateWorkflow(context.Background(), client.UpdateWorkflowOptions{
+		WorkflowID:   workflowRun.GetID(),
+		RunID:        workflowRun.GetRunID(),
+		UpdateName:   "processEvent",
+		WaitForStage: client.WorkflowUpdateStageCompleted,
+		Args:         []interface{}{requestCtx1, incrementSignal1},
+	})
+	s.Require().NoError(err)
+	
+	ctx1, cancel1 := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel1()
+	
+	var result1 *demov1.DemoEngineState
+	err = updateHandle1.Get(ctx1, &result1)
+	s.Require().NoError(err)
+	s.T().Log("🎯 First increment completed!")
+	
+	s.Equal(int64(3), result1.CurrentValue)
+	s.Len(result1.History, 1)
 
 	// Second update: Increment by 7
-	s.env.RegisterDelayedCallback(func() {
-		incrementSignal := &demov1.DemoEngineSignal{
-			Signal: &demov1.DemoEngineSignal_Increment{
-				Increment: &demov1.IncrementSignal{
-					Amount:    7,
-					Reason:    "Second increment",
-					Timestamp: timestamppb.Now(),
-				},
+	incrementSignal2 := &demov1.DemoEngineSignal{
+		Signal: &demov1.DemoEngineSignal_Increment{
+			Increment: &demov1.IncrementSignal{
+				Amount:    7,
+				Reason:    "Second increment",
+				Timestamp: timestamppb.Now(),
 			},
-		}
+		},
+	}
 
-		requestCtx := &entityv1.RequestContext{
-			UserId:         "test-user",
-			OrgId:          "test-org",
-			IdempotencyKey: "update-2",
-			RequestTime:    timestamppb.Now(),
-		}
+	requestCtx2 := &entityv1.RequestContext{
+		UserId:         "test-user",
+		OrgId:          "test-org",
+		TeamId:         "test-team",
+		Environment:    "test",
+		Tenant:         "test-tenant",
+		IdempotencyKey: "update-2",
+		RequestTime:    timestamppb.Now(),
+	}
 
-		s.env.UpdateWorkflow("processEvent", "multi-update-2", &testsuite.TestUpdateCallback{
-			OnComplete: func(response interface{}, err error) {
-				s.NoError(err)
-				result := response.(*demov1.DemoEngineState)
-				s.Equal(int64(10), result.CurrentValue) // 3 + 7 = 10
-				s.Len(result.History, 2)
-				s.Equal("Second increment", result.History[1].Reason)
-			},
-		}, requestCtx, incrementSignal)
-	}, time.Millisecond*200)
+	s.T().Log("⏰ Sending second increment (7)")
+	updateHandle2, err := s.client.UpdateWorkflow(context.Background(), client.UpdateWorkflowOptions{
+		WorkflowID:   workflowRun.GetID(),
+		RunID:        workflowRun.GetRunID(),
+		UpdateName:   "processEvent",
+		WaitForStage: client.WorkflowUpdateStageCompleted,
+		Args:         []interface{}{requestCtx2, incrementSignal2},
+	})
+	s.Require().NoError(err)
+	
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel2()
+	
+	var result2 *demov1.DemoEngineState
+	err = updateHandle2.Get(ctx2, &result2)
+	s.Require().NoError(err)
+	s.T().Log("🎯 Second increment completed!")
+	
+	s.Equal(int64(10), result2.CurrentValue) // 3 + 7 = 10
+	s.Len(result2.History, 2)
+	s.Equal("Second increment", result2.History[1].Reason)
 
 	// Third update: Reset
-	s.env.RegisterDelayedCallback(func() {
-		resetSignal := &demov1.DemoEngineSignal{
-			Signal: &demov1.DemoEngineSignal_Reset_{
-				Reset_: &demov1.ResetSignal{
-					Reason:    "Reset after increments",
-					Timestamp: timestamppb.Now(),
-				},
+	resetSignal := &demov1.DemoEngineSignal{
+		Signal: &demov1.DemoEngineSignal_Reset_{
+			Reset_: &demov1.ResetSignal{
+				Reason:    "Reset after increments",
+				Timestamp: timestamppb.Now(),
 			},
-		}
+		},
+	}
 
-		requestCtx := &entityv1.RequestContext{
-			UserId:         "test-user",
-			OrgId:          "test-org",
-			IdempotencyKey: "update-3",
-			RequestTime:    timestamppb.Now(),
-		}
+	requestCtx3 := &entityv1.RequestContext{
+		UserId:         "test-user",
+		OrgId:          "test-org",
+		TeamId:         "test-team",
+		Environment:    "test",
+		Tenant:         "test-tenant",
+		IdempotencyKey: "update-3",
+		RequestTime:    timestamppb.Now(),
+	}
 
-		s.env.UpdateWorkflow("processEvent", "multi-update-3", &testsuite.TestUpdateCallback{
-			OnComplete: func(response interface{}, err error) {
-				s.NoError(err)
-				result := response.(*demov1.DemoEngineState)
-				s.Equal(int64(0), result.CurrentValue) // Reset to 0
-				s.Len(result.History, 3)
-				s.Equal("Reset after increments", result.History[2].Reason)
-				s.Equal(demov1.CounterEventType_COUNTER_EVENT_TYPE_RESET, result.History[2].Type)
-			},
-		}, requestCtx, resetSignal)
-	}, time.Millisecond*300)
-
-	// Entity workflows are long-running and don't complete naturally
+	s.T().Log("⏰ Sending reset")
+	updateHandle3, err := s.client.UpdateWorkflow(context.Background(), client.UpdateWorkflowOptions{
+		WorkflowID:   workflowRun.GetID(),
+		RunID:        workflowRun.GetRunID(),
+		UpdateName:   "processEvent",
+		WaitForStage: client.WorkflowUpdateStageCompleted,
+		Args:         []interface{}{requestCtx3, resetSignal},
+	})
+	s.Require().NoError(err)
+	
+	ctx3, cancel3 := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel3()
+	
+	var result3 *demov1.DemoEngineState
+	err = updateHandle3.Get(ctx3, &result3)
+	s.Require().NoError(err)
+	s.T().Log("🎯 Reset completed!")
+	
+	s.Equal(int64(0), result3.CurrentValue) // Reset to 0
+	s.Len(result3.History, 3)
+	s.Equal("Reset after increments", result3.History[2].Reason)
+	s.Equal(demov1.CounterEventType_COUNTER_EVENT_TYPE_RESET, result3.History[2].Type)
+	
+	s.T().Log("✅ Multiple sequential updates test completed successfully!")
 }
 
 func (s *DemoEntityWorkflowUpdateTestSuite) Test_UpdateProcessEvent_ValidationBusinessRules() {
@@ -425,39 +624,62 @@ func (s *DemoEntityWorkflowUpdateTestSuite) Test_UpdateProcessEvent_ValidationBu
 		InitialState: initialState,
 	}
 
-	s.env.ExecuteWorkflow(DemoEntityWorkflow, params)
+	// Start the workflow
+	s.T().Log("🚀 Starting workflow for validation test")
+	workflowRun, err := s.client.ExecuteWorkflow(context.Background(), client.StartWorkflowOptions{
+		ID:        "test-validation-workflow-" + time.Now().Format("20060102-150405-000"),
+		TaskQueue: s.taskQueue,
+	}, DemoEntityWorkflow, params)
+	s.Require().NoError(err)
+	s.T().Log("📋 Workflow started")
+
+	// Give workflow a moment to initialize
+	time.Sleep(300 * time.Millisecond)
 
 	// Try to increment beyond max value
-	s.env.RegisterDelayedCallback(func() {
-		incrementSignal := &demov1.DemoEngineSignal{
-			Signal: &demov1.DemoEngineSignal_Increment{
-				Increment: &demov1.IncrementSignal{
-					Amount:    10, // This would make it 105, exceeding max of 100
-					Reason:    "Test max validation",
-					Timestamp: timestamppb.Now(),
-				},
+	incrementSignal := &demov1.DemoEngineSignal{
+		Signal: &demov1.DemoEngineSignal_Increment{
+			Increment: &demov1.IncrementSignal{
+				Amount:    10, // This would make it 105, exceeding max of 100
+				Reason:    "Test max validation",
+				Timestamp: timestamppb.Now(),
 			},
-		}
+		},
+	}
 
-		requestCtx := &entityv1.RequestContext{
-			UserId:         "test-user",
-			OrgId:          "test-org",
-			IdempotencyKey: "validation-test-1",
-			RequestTime:    timestamppb.Now(),
-		}
+	requestCtx := &entityv1.RequestContext{
+		UserId:         "test-user",
+		OrgId:          "test-org",
+		TeamId:         "test-team",
+		Environment:    "test",
+		Tenant:         "test-tenant",
+		IdempotencyKey: "validation-test-1",
+		RequestTime:    timestamppb.Now(),
+	}
 
-		s.env.UpdateWorkflow("processEvent", "validation-update", &testsuite.TestUpdateCallback{
-			OnComplete: func(response interface{}, err error) {
-				s.NoError(err)
-				result := response.(*demov1.DemoEngineState)
-				// Should be capped at max value
-				s.Equal(int64(100), result.CurrentValue)
-				s.Len(result.History, 1)
-			},
-		}, requestCtx, incrementSignal)
-	}, time.Millisecond*100)
-
-	// Entity workflows are long-running and don't complete naturally
+	s.T().Log("⏰ Sending increment that exceeds max value (should be capped)")
+	updateHandle, err := s.client.UpdateWorkflow(context.Background(), client.UpdateWorkflowOptions{
+		WorkflowID:   workflowRun.GetID(),
+		RunID:        workflowRun.GetRunID(),
+		UpdateName:   "processEvent",
+		WaitForStage: client.WorkflowUpdateStageCompleted,
+		Args:         []interface{}{requestCtx, incrementSignal},
+	})
+	s.Require().NoError(err)
+	
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	
+	var updateResult *demov1.DemoEngineState
+	err = updateHandle.Get(ctx, &updateResult)
+	s.Require().NoError(err)
+	s.T().Log("🎯 Validation update completed!")
+	
+	// Should be capped at max value
+	s.Equal(int64(100), updateResult.CurrentValue)
+	s.Len(updateResult.History, 1)
+	
+	s.T().Log("✅ Validation test completed successfully!")
 }
 
 func (s *DemoEntityWorkflowUpdateTestSuite) Test_UpdateProcessEvent_CombineSignalsAndUpdates() {
@@ -480,66 +702,106 @@ func (s *DemoEntityWorkflowUpdateTestSuite) Test_UpdateProcessEvent_CombineSigna
 		InitialState: initialState,
 	}
 
-	s.env.ExecuteWorkflow(DemoEntityWorkflow, params)
+	// Start the workflow
+	s.T().Log("🚀 Starting workflow for mixed signal and update test")
+	workflowRun, err := s.client.ExecuteWorkflow(context.Background(), client.StartWorkflowOptions{
+		ID:        "test-mixed-workflow-" + time.Now().Format("20060102-150405-000"),
+		TaskQueue: s.taskQueue,
+	}, DemoEntityWorkflow, params)
+	s.Require().NoError(err)
+	s.T().Log("📋 Workflow started")
+
+	// Give workflow a moment to initialize
+	time.Sleep(300 * time.Millisecond)
 
 	// Send signal first
-	s.env.RegisterDelayedCallback(func() {
-		incrementSignal := &demov1.DemoEngineSignal{
-			Signal: &demov1.DemoEngineSignal_Increment{
-				Increment: &demov1.IncrementSignal{
-					Amount:    3,
-					Reason:    "Via signal",
-					Timestamp: timestamppb.Now(),
-				},
+	s.T().Log("⏰ Sending increment signal via processEvent")
+	incrementSignal := &demov1.DemoEngineSignal{
+		Signal: &demov1.DemoEngineSignal_Increment{
+			Increment: &demov1.IncrementSignal{
+				Amount:    3,
+				Reason:    "Via signal",
+				Timestamp: timestamppb.Now(),
 			},
-		}
+		},
+	}
 
-		envelope := &basev1.EventEnvelope{
-			SequenceNumber: 1,
-			EventId:        "signal-event-1",
-			Timestamp:      timestamppb.Now(),
-			Data:           mustMarshalAny(incrementSignal),
-		}
+	requestCtx := &entityv1.RequestContext{
+		UserId:         "test-user",
+		OrgId:          "test-org",
+		TeamId:         "test-team",
+		Environment:    "test",
+		Tenant:         "test-tenant",
+		IdempotencyKey: "mixed-update-1",
+		RequestTime:    timestamppb.Now(),
+	}
 
-		s.env.SignalWorkflow("process-event", envelope)
-	}, time.Millisecond*100)
+	updateHandle1, err := s.client.UpdateWorkflow(context.Background(), client.UpdateWorkflowOptions{
+		WorkflowID:   workflowRun.GetID(),
+		RunID:        workflowRun.GetRunID(),
+		UpdateName:   "processEvent",
+		WaitForStage: client.WorkflowUpdateStageCompleted,
+		Args:         []interface{}{requestCtx, incrementSignal},
+	})
+	s.Require().NoError(err)
+	
+	ctx1, cancel1 := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel1()
+	
+	var result1 *demov1.DemoEngineState
+	err = updateHandle1.Get(ctx1, &result1)
+	s.Require().NoError(err)
+	s.T().Log("🎯 Signal update completed!")
+	
+	s.Equal(int64(3), result1.CurrentValue)
+	s.Len(result1.History, 1)
 
 	// Send update after signal
-	s.env.RegisterDelayedCallback(func() {
-		incrementSignal := &demov1.DemoEngineSignal{
-			Signal: &demov1.DemoEngineSignal_Increment{
-				Increment: &demov1.IncrementSignal{
-					Amount:    7,
-					Reason:    "Via update",
-					Timestamp: timestamppb.Now(),
-				},
+	s.T().Log("⏰ Sending increment update via processEvent")
+	incrementSignal2 := &demov1.DemoEngineSignal{
+		Signal: &demov1.DemoEngineSignal_Increment{
+			Increment: &demov1.IncrementSignal{
+				Amount:    7,
+				Reason:    "Via update",
+				Timestamp: timestamppb.Now(),
 			},
-		}
+		},
+	}
 
-		requestCtx := &entityv1.RequestContext{
-			UserId:         "test-user",
-			OrgId:          "test-org",
-			IdempotencyKey: "mixed-update-1",
-			RequestTime:    timestamppb.Now(),
-		}
+	requestCtx2 := &entityv1.RequestContext{
+		UserId:         "test-user",
+		OrgId:          "test-org",
+		TeamId:         "test-team",
+		Environment:    "test",
+		Tenant:         "test-tenant",
+		IdempotencyKey: "mixed-update-1",
+		RequestTime:    timestamppb.Now(),
+	}
 
-		s.env.UpdateWorkflow("processEvent", "mixed-update", &testsuite.TestUpdateCallback{
-			OnComplete: func(response interface{}, err error) {
-				s.NoError(err)
-				result := response.(*demov1.DemoEngineState)
-				// Should have both signal and update results
-				s.Equal(int64(10), result.CurrentValue) // 3 + 7 = 10
-				s.Len(result.History, 2)
-				
-				// Verify both events are recorded
-				reasons := []string{result.History[0].Reason, result.History[1].Reason}
-				s.Contains(reasons, "Via signal")
-				s.Contains(reasons, "Via update")
-			},
-		}, requestCtx, incrementSignal)
-	}, time.Millisecond*200)
-
-	// Entity workflows are long-running - we only test the update processing, not completion
-}
-
-// Note: mustMarshalAny is defined in entity_workflow_test.go 
+	updateHandle2, err := s.client.UpdateWorkflow(context.Background(), client.UpdateWorkflowOptions{
+		WorkflowID:   workflowRun.GetID(),
+		RunID:        workflowRun.GetRunID(),
+		UpdateName:   "processEvent",
+		WaitForStage: client.WorkflowUpdateStageCompleted,
+		Args:         []interface{}{requestCtx2, incrementSignal2},
+	})
+	s.Require().NoError(err)
+	
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel2()
+	
+	var result2 *demov1.DemoEngineState
+	err = updateHandle2.Get(ctx2, &result2)
+	s.Require().NoError(err)
+	s.T().Log("🎯 Update update completed!")
+	
+	s.Equal(int64(10), result2.CurrentValue) // 3 + 7 = 10
+	s.Len(result2.History, 2)
+	
+	// Verify both events are recorded
+	reasons := []string{result2.History[0].Reason, result2.History[1].Reason}
+	s.Contains(reasons, "Via signal")
+	s.Contains(reasons, "Via update")
+	
+	s.T().Log("✅ Mixed signal and update test completed successfully!")
+} 
