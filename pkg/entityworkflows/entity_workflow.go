@@ -218,8 +218,8 @@ func EntityWorkflow[TState, TEvent, TTransitionInfo proto.Message](
 		workflowState = params.WorkflowState
 		logger.Info("📋 Restored workflow state from continue-as-new", "requestCount", workflowState.requestCount)
 	} else {
-		workflowState = NewEntityWorkflowState(time.Time{}) // No cutoff for new workflows
-		logger.Info("🆕 Created new workflow state")
+		workflowState = NewEntityWorkflowState(workflow.Now(ctx)) // Fresh workflow cutoff at start time
+		logger.Info("🆕 Created new workflow state", "cutoff", workflow.Now(ctx))
 	}
 	
 	// Initialize EntityMetadata - either from workflowState (continue-as-new) or first RequestContext
