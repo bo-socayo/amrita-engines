@@ -240,4 +240,55 @@ func ApplyBusinessDefaults(state *demov1.DemoEngineState) *demov1.DemoEngineStat
 	}
 
 	return state
+}
+
+// CompressState implements state compression for continue-as-new operations.
+// This method optimizes the demo engine state by:
+// - Limiting history to the most recent events
+// - Clearing old metadata entries
+// - Preserving essential state (current value, config, etc.)
+func CompressState(ctx context.Context, currentState *demov1.DemoEngineState) (*demov1.DemoEngineState, error) {
+	if currentState == nil {
+		return nil, fmt.Errorf("cannot compress nil state")
+	}
+
+	// Clone the state to avoid mutating the original
+	compressedState := proto.Clone(currentState).(*demov1.DemoEngineState)
+
+	// Configuration for compression thresholds
+	const (
+		MaxHistoryEvents = 50   // Keep only the last 50 events
+		MaxMetadataEntries = 10 // Keep only 10 metadata entries
+	)
+
+	// Compress history: keep only the most recent events
+	if len(compressedState.History) > MaxHistoryEvents {
+		// Keep the most recent events
+		recentEvents := compressedState.History[len(compressedState.History)-MaxHistoryEvents:]
+		compressedState.History = make([]*demov1.CounterEvent, len(recentEvents))
+		copy(compressedState.History, recentEvents)
+		
+		// Log compression for debugging
+		fmt.Printf("Compressed history from %d to %d events\n", 
+			len(currentState.History), len(compressedState.History))
+	}
+
+	// Compress metadata: keep only recent entries (simple strategy)
+	if len(compressedState.Metadata) > MaxMetadataEntries {
+		// For demo purposes, just clear old metadata
+		// In a real implementation, you might preserve specific keys or use LRU
+		compressedState.Metadata = make(map[string]*anypb.Any)
+		
+		fmt.Printf("Cleared metadata entries due to size (%d entries)\n", 
+			len(currentState.Metadata))
+	}
+
+	// Ensure essential fields are preserved
+	// These should always be maintained across continue-as-new:
+	// - CurrentValue (the main counter state)
+	// - Config (business rules)
+	// - NextEventId (for event ordering)
+	// - LastUpdated (for temporal consistency)
+
+	return compressedState, nil
 } 

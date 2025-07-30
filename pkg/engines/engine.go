@@ -382,4 +382,16 @@ type ProcessorFunc[TState, TEvent, TTransitionInfo proto.Message] func(
 //
 // Returns:
 //   State with business defaults applied
-type DefaultsFunc[TState proto.Message] func(state TState) TState 
+type DefaultsFunc[TState proto.Message] func(state TState) TState
+
+// CompressFunc defines the signature for state compression before continue-as-new.
+// This allows engines to optimize/compress state before workflow continuation.
+//
+// Args:
+//   ctx: Context for cancellation
+//   currentState: State to compress
+//
+// Returns:
+//   compressedState: Optimized state for continue-as-new
+//   error: Compression error, if any
+type CompressFunc[TState proto.Message] func(ctx context.Context, currentState TState) (TState, error) 

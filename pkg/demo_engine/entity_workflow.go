@@ -4,11 +4,12 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/bo-socayo/amrita-engines/pkg/engines"
-	"github.com/bo-socayo/amrita-engines/pkg/entityworkflows"
+	"go.temporal.io/sdk/workflow"
+
 	demov1 "github.com/bo-socayo/amrita-engines/gen/engines/demo/v1"
 	entityv1 "github.com/bo-socayo/amrita-engines/gen/entity/v1"
-	"go.temporal.io/sdk/workflow"
+	"github.com/bo-socayo/amrita-engines/pkg/engines"
+	"github.com/bo-socayo/amrita-engines/pkg/entityworkflows"
 )
 
 // DemoWorkflowIDHandler handles workflow ID generation for demo engine
@@ -51,7 +52,7 @@ func DemoEntityWorkflow(
 	signalDescriptor := (&demov1.DemoEngineSignal{}).ProtoReflect().Descriptor()
 	transitionDescriptor := (&demov1.DemoEngineTransitionInfo{}).ProtoReflect().Descriptor()
 
-	// Create demo engine
+	// Create demo engine with custom compression
 	config := engines.BaseEngineConfig[*demov1.DemoEngineState, *demov1.DemoEngineSignal, *demov1.DemoEngineTransitionInfo]{
 		EngineName:           EngineName,
 		BusinessLogicVersion: BusinessLogicVersion,
@@ -60,6 +61,7 @@ func DemoEntityWorkflow(
 		TransitionTypeName:   string(transitionDescriptor.Name()),
 		Processor:            ProcessSignal,
 		Defaults:             ApplyBusinessDefaults,
+		Compress:             CompressState, // Use our custom compression function
 	}
 	
 	engine := engines.NewBaseEngine(config)

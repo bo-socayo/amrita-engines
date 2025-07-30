@@ -27,6 +27,7 @@ type BaseEngine[TState, TEvent, TTransitionInfo proto.Message] struct {
 	businessLogicVersion string
 	processor            ProcessorFunc[TState, TEvent, TTransitionInfo]
 	defaults             DefaultsFunc[TState]
+	compress             CompressFunc[TState] // Optional: custom state compression
 	
 	// State management
 	businessState        TState
@@ -46,6 +47,7 @@ type BaseEngineConfig[TState, TEvent, TTransitionInfo proto.Message] struct {
 	BusinessLogicVersion string
 	Processor            ProcessorFunc[TState, TEvent, TTransitionInfo]
 	Defaults             DefaultsFunc[TState]
+	Compress             CompressFunc[TState] // Optional: custom state compression
 	StateTypeName        string
 	EventTypeName        string
 	TransitionTypeName   string
@@ -60,6 +62,7 @@ func NewBaseEngine[TState, TEvent, TTransitionInfo proto.Message](
 		businessLogicVersion: config.BusinessLogicVersion,
 		processor:            config.Processor,
 		defaults:             config.Defaults,
+		compress:             config.Compress,
 		stateTypeName:        config.StateTypeName,
 		eventTypeName:        config.EventTypeName,
 		transitionTypeName:   config.TransitionTypeName,
@@ -207,8 +210,13 @@ func (e *BaseEngine[TState, TEvent, TTransitionInfo]) GetEngineName() string {
 }
 
 // CompressState provides default implementation that returns state unchanged.
-// Concrete engines can override this to optimize state before continue-as-new.
+// If a custom compress function is configured, it will be used instead.
 func (e *BaseEngine[TState, TEvent, TTransitionInfo]) CompressState(ctx context.Context, currentState TState) (TState, error) {
+	// Use custom compress function if provided
+	if e.compress != nil {
+		return e.compress(ctx, currentState)
+	}
+	
 	// ✅ Default implementation: return state unchanged
 	return currentState, nil
 }
