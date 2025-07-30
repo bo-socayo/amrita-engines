@@ -121,7 +121,7 @@ func (s *SQLiteStorageAdapter) StoreEntityWorkflowRecord(ctx context.Context, re
 			}
 		}
 
-		// Execute insert
+		// Execute insert using sequence number from entity workflow
 		_, err := s.insertStmt.ExecContext(ctx,
 			record.EntityID, record.EntityType, record.SequenceNumber,
 			record.ProcessedAt, record.EventTime,
