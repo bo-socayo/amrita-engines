@@ -254,7 +254,7 @@ func EntityWorkflow[TState, TEvent, TTransitionInfo proto.Message](
 			// This is a critical section that ensures only one event is processed at a time
 			// It prevents race conditions and ensures deterministic execution
 			// This is a key part of the engine's determinism guarantee
-			err := stateMutex.Lock(ctx)
+			err = stateMutex.Lock(ctx)
 			if err != nil {
 				return zero, err
 			}
