@@ -4,10 +4,13 @@ import (
 	"context"
 	"fmt"
 	"reflect"
-	"strings"
-	"time"
 
 	"github.com/bo-socayo/amrita-engines/pkg/engines"
+	"github.com/bo-socayo/amrita-engines/pkg/entityworkflows/auth"
+	"github.com/bo-socayo/amrita-engines/pkg/entityworkflows/handlers"
+	"github.com/bo-socayo/amrita-engines/pkg/entityworkflows/ids"
+	"github.com/bo-socayo/amrita-engines/pkg/entityworkflows/state"
+	"github.com/bo-socayo/amrita-engines/pkg/entityworkflows/utils"
 	entityv1 "github.com/bo-socayo/amrita-engines/gen/entity/v1"
 	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/workflow"
@@ -16,219 +19,54 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
-// Helper function for min of two integers
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
+// Type aliases for backward compatibility - now imported from other packages
+type WorkflowIDHandler = ids.WorkflowIDHandler
+type EntityIDHandler = ids.EntityIDHandler
+type EntityWorkflowParams[TState proto.Message] = utils.EntityWorkflowParams[TState]
+type EntityQueryResponse[TState proto.Message] = handlers.EntityQueryResponse[TState]
 
-// EntityWorkflowState tracks requests and operations for continue-as-new decisions
-type EntityWorkflowState struct {
-	requestCount         int
-	pendingUpdates       int
-	processedRequests    map[string]time.Time // ✅ Track idempotency_key -> processed_time
-	requestsBeforeCAN    int                  // Threshold for continue-as-new
-	idempotencyCutoff    time.Time            // ✅ Cutoff from previous workflow (inclusive boundary)
-	sequenceNumber       int64                // ✅ Monotonic counter preserved across continue-as-new
-	entityMetadata       *entityv1.EntityMetadata // ✅ Preserved EntityMetadata across continue-as-new
-}
+// Function aliases for backward compatibility
+var NewEntityIDHandler = ids.NewEntityIDHandler
+// Note: GetEntityTypeFromProtobuf is a generic function and must be called directly from ids package
 
-// NewEntityWorkflowState creates initial workflow state
-func NewEntityWorkflowState(idempotencyCutoff time.Time) *EntityWorkflowState {
-	return &EntityWorkflowState{
-		requestCount:         0,
-		pendingUpdates:       0,
-		processedRequests:    make(map[string]time.Time),
-		requestsBeforeCAN:    1000,        // ✅ Reasonable default from docs
-		idempotencyCutoff:    idempotencyCutoff, // ✅ Cutoff from previous workflow
-		sequenceNumber:       0,           // ✅ Starts at 0 for new workflows
-		entityMetadata:       nil,         // ✅ Will be initialized from first RequestContext
-	}
-}
-
-// NewEntityWorkflowStateForContinuation creates workflow state for continue-as-new with preserved sequence number and metadata
-func NewEntityWorkflowStateForContinuation(idempotencyCutoff time.Time, sequenceNumber int64, entityMetadata *entityv1.EntityMetadata) *EntityWorkflowState {
-	return &EntityWorkflowState{
-		requestCount:         0,           // ✅ Reset counters
-		pendingUpdates:       0,           // ✅ Reset counters
-		processedRequests:    make(map[string]time.Time), // ✅ Fresh idempotency cache
-		requestsBeforeCAN:    1000,        // ✅ Reset threshold
-		idempotencyCutoff:    idempotencyCutoff, // ✅ Preserved cutoff
-		sequenceNumber:       sequenceNumber,   // ✅ CRITICAL: Preserve monotonic sequence
-		entityMetadata:       entityMetadata,   // ✅ CRITICAL: Preserve authorization context
-	}
-}
-
-// WorkflowIDHandler provides pluggable ID handling for different entity types
-type WorkflowIDHandler interface {
-	BuildWorkflowID(metadata *entityv1.EntityMetadata) string
-	ParseWorkflowID(workflowID string) (entityType, entityID string, err error)
-	ExtractContextFromMetadata(metadata *entityv1.EntityMetadata) map[string]string
-}
-
-// EntityIDHandler handles standard business entity workflow IDs
-type EntityIDHandler struct{}
-
-func (h *EntityIDHandler) BuildWorkflowID(metadata *entityv1.EntityMetadata) string {
-	return fmt.Sprintf("%s-%s", metadata.EntityType, metadata.EntityId)
-}
-
-func (h *EntityIDHandler) ParseWorkflowID(workflowID string) (entityType, entityID string, err error) {
-	parts := strings.SplitN(workflowID, "-", 2)
-	if len(parts) < 2 {
-		return "", "", fmt.Errorf("invalid entity workflow ID format: %s", workflowID)
-	}
-	return parts[0], parts[1], nil
-}
-
-func (h *EntityIDHandler) ExtractContextFromMetadata(metadata *entityv1.EntityMetadata) map[string]string {
-	return map[string]string{
-		"entity_type": metadata.EntityType,
-		"entity_id":   metadata.EntityId,
-		"org_id":      metadata.OrgId,
-		"team_id":     metadata.TeamId,
-		"user_id":     metadata.UserId,
-		"environment": metadata.Environment,
-		"tenant":      metadata.Tenant,
-	}
-}
-
-// newInstance creates a new instance of type T for unmarshaling
-func newInstance[T any]() T {
-	var zero T
-	t := reflect.TypeOf(zero)
-	
-	// If T is a pointer type, create a new instance of the pointed-to type
-	if t != nil && t.Kind() == reflect.Ptr {
-		// Create new instance of the element type
-		elem := reflect.New(t.Elem())
-		instance := elem.Interface().(T)
-		
-		// If it's a protobuf message, ensure it's properly initialized
-		if msg, ok := any(instance).(proto.Message); ok {
-			proto.Reset(msg)
-		}
-		
-		return instance
-	}
-	
-	// For non-pointer types, return zero value
-	return zero
-}
-
-// EntityWorkflowParams contains the parameters for starting an entity workflow
-type EntityWorkflowParams[TState proto.Message] struct {
-	EntityId      string               `json:"entity_id"`       // Required: Entity identifier  
-	InitialState  TState               `json:"initial_state"`   // Optional: Initial state
-	WorkflowState *EntityWorkflowState `json:"workflow_state,omitempty"` // Internal: for continue-as-new
-}
-
-// EntityQueryResponse contains the full engine state for queries
-// Uses JSON string for CurrentState to avoid protobuf oneof field marshaling issues
-type EntityQueryResponse[TState proto.Message] struct {
-	CurrentStateJSON string                   `json:"current_state_json"`
-	Metadata         *entityv1.EntityMetadata `json:"metadata"`
-	IsInitialized    bool                     `json:"is_initialized"`
-}
-
-// ✅ Use client-provided idempotency key for time-based deduplication with cutoff
-func (state *EntityWorkflowState) isRequestProcessed(ctx workflow.Context, idempotencyKey string, requestTime time.Time) bool {
-	logger := workflow.GetLogger(ctx)
-	
-	if idempotencyKey == "" {
-		logger.Warn("⚠️ No idempotency key provided - cannot deduplicate")
-		return false
-	}
-	
-	// ✅ First check: Is request before/at cutoff from previous workflow? (INCLUSIVE)
-	if !requestTime.After(state.idempotencyCutoff) {  // Same as requestTime <= cutoff
-		logger.Info("🚫 Request before/at cutoff from previous workflow", 
-			"idempotencyKey", idempotencyKey,
-			"requestTime", requestTime, 
-			"cutoff", state.idempotencyCutoff)
-		return true  // Treat as "already processed"
-	}
-	
-	// Second check: Normal deduplication within current workflow
-	processedTime, exists := state.processedRequests[idempotencyKey]
-	if !exists {
-		return false
-	}
-	
-	logger.Info("🔁 Request already processed within current workflow", 
-		"idempotencyKey", idempotencyKey, 
-		"processedTime", processedTime)
-	return true
-}
-
-// ✅ Mark request as processed using client idempotency key
-func (state *EntityWorkflowState) markRequestProcessed(ctx workflow.Context, idempotencyKey string) {
-	logger := workflow.GetLogger(ctx)
-	
-	if idempotencyKey == "" {
-		logger.Warn("⚠️ Cannot mark request as processed - no idempotency key")
-		return
-	}
-	
-	state.processedRequests[idempotencyKey] = workflow.Now(ctx)
-	logger.Info("✅ Request marked as processed", "idempotencyKey", idempotencyKey)
-}
-
-// ✅ Prepare cutoff for next workflow (newest processed request time)
-func (state *EntityWorkflowState) getIdempotencyCutoffForContinuation(ctx workflow.Context) time.Time {
-	logger := workflow.GetLogger(ctx)
-	
-	var newestTime time.Time
-	for idempotencyKey, processedTime := range state.processedRequests {
-		if processedTime.After(newestTime) {
-			newestTime = processedTime
-			logger.Debug("📅 Found newer cutoff candidate", 
-				"idempotencyKey", idempotencyKey, 
-				"time", processedTime)
-		}
-	}
-	
-	logger.Info("🔄 Prepared idempotency cutoff for continue-as-new", 
-		"cutoff", newestTime, 
-		"totalProcessed", len(state.processedRequests))
-	
-	return newestTime
-}
+// Idempotency methods are now in the state package
 
 // EntityWorkflow is the generic entity workflow that can work with any engine type
 // It supports pluggable workflow ID handling for different entity types
 func EntityWorkflow[TState, TEvent, TTransitionInfo proto.Message](
 	ctx workflow.Context, 
-	params EntityWorkflowParams[TState],
+	params utils.EntityWorkflowParams[TState],
 	engine engines.Engine[TState, TEvent, TTransitionInfo],
-	idHandler WorkflowIDHandler,
+	idHandler ids.WorkflowIDHandler,
 ) error {
 	logger := workflow.GetLogger(ctx)
 	
 	// Auto-derive entity type from the engine's state protobuf type
-	entityType := GetEntityTypeFromProtobuf[TState]()
+	entityType := ids.GetEntityTypeFromProtobuf[TState]()
 	
 	logger.Info("🚀 EntityWorkflow starting", "entityId", params.EntityId, "entityType", entityType)
 
 	// ✅ Initialize workflow state tracking
-	var workflowState *EntityWorkflowState
+	var workflowState *state.WorkflowState
 	if params.WorkflowState != nil {
 		workflowState = params.WorkflowState
-		logger.Info("📋 Restored workflow state from continue-as-new", "requestCount", workflowState.requestCount)
+		logger.Info("📋 Restored workflow state from continue-as-new", "requestCount", workflowState.GetRequestCount())
 	} else {
-		workflowState = NewEntityWorkflowState(workflow.Now(ctx)) // Fresh workflow cutoff at start time
+		workflowState = state.NewWorkflowState(workflow.Now(ctx)) // Fresh workflow cutoff at start time
 		logger.Info("🆕 Created new workflow state", "cutoff", workflow.Now(ctx))
 	}
+	
+	// ✅ Initialize authorization and metadata managers
+	authorizer := auth.NewRequestAuthorizer()
+	metadataManager := auth.NewEntityMetadataManager()
 	
 	// Initialize EntityMetadata - either from workflowState (continue-as-new) or first RequestContext
 	var entityMetadata *entityv1.EntityMetadata
 	var metadataInitialized bool
 	
 	// Check if EntityMetadata was preserved from continue-as-new
-	if workflowState.entityMetadata != nil {
-		entityMetadata = workflowState.entityMetadata
+	if workflowState.GetEntityMetadata() != nil {
+		entityMetadata = workflowState.GetEntityMetadata()
 		metadataInitialized = true
 		logger.Info("✅ EntityMetadata restored from continue-as-new", 
 			"orgId", entityMetadata.OrgId, 
@@ -248,7 +86,7 @@ func EntityWorkflow[TState, TEvent, TTransitionInfo proto.Message](
 		currentState = params.InitialState
 		logger.Info("📋 Using provided initial state")
 	} else {
-		currentState = newInstance[TState]()
+		currentState = utils.NewInstance[TState]()
 		logger.Info("🆕 Creating new instance for initial state")
 	}
 
@@ -365,19 +203,21 @@ func EntityWorkflow[TState, TEvent, TTransitionInfo proto.Message](
 					return zero, fmt.Errorf("first request must include RequestContext")
 				}
 				
-				entityMetadata = &entityv1.EntityMetadata{
-					EntityId:    params.EntityId,
-					EntityType:  entityType,
-					OrgId:       requestCtx.OrgId,
-					TeamId:      requestCtx.TeamId,
-					UserId:      requestCtx.UserId,
-					Environment: requestCtx.Environment,
-					Tenant:      requestCtx.Tenant,
-					CreatedAt:   timestamppb.New(workflow.Now(ctx)),
+				// Use metadata manager to initialize EntityMetadata
+				var err error
+				entityMetadata, err = metadataManager.InitializeFromRequest(
+					params.EntityId,
+					entityType,
+					requestCtx,
+					workflow.Now(ctx),
+				)
+				if err != nil {
+					logger.Error("❌ Failed to initialize EntityMetadata", "error", err)
+					return zero, fmt.Errorf("failed to initialize entity metadata: %w", err)
 				}
 				
 				// Store in workflowState for persistence across continue-as-new
-				workflowState.entityMetadata = entityMetadata
+				workflowState.SetEntityMetadata(entityMetadata)
 				metadataInitialized = true
 				
 				logger.Info("✅ EntityMetadata initialized from first RequestContext", 
@@ -392,13 +232,16 @@ func EntityWorkflow[TState, TEvent, TTransitionInfo proto.Message](
 					return zero, fmt.Errorf("RequestContext required")
 				}
 				
-				if !authorizeRequest(requestCtx, entityMetadata) {
+				// Use authorizer to validate request
+				err := authorizer.AuthorizeRequest(requestCtx, entityMetadata)
+				if err != nil {
 					logger.Error("❌ Authorization failed - RequestContext doesn't match EntityMetadata",
 						"requestOrgId", requestCtx.OrgId,
 						"entityOrgId", entityMetadata.OrgId,
 						"requestTenant", requestCtx.Tenant,
-						"entityTenant", entityMetadata.Tenant)
-					return zero, fmt.Errorf("authorization failed: tenant/org mismatch")
+						"entityTenant", entityMetadata.Tenant,
+						"error", err)
+					return zero, fmt.Errorf("authorization failed: %w", err)
 				}
 				logger.Debug("✅ Authorization validated")
 			}
@@ -412,28 +255,28 @@ func EntityWorkflow[TState, TEvent, TTransitionInfo proto.Message](
 
 			// ✅ Check idempotency using RequestContext
 			if requestCtx != nil && requestCtx.IdempotencyKey != "" {
-				if workflowState.isRequestProcessed(ctx, requestCtx.IdempotencyKey, requestCtx.RequestTime.AsTime()) {
+				if workflowState.IsRequestProcessed(ctx, requestCtx.IdempotencyKey, requestCtx.RequestTime.AsTime()) {
 					logger.Info("🔁 Request already processed (idempotent)", "idempotencyKey", requestCtx.IdempotencyKey)
 					return currentState, nil
 				}
 			}
 
 			// ✅ Track request and pending operations
-			workflowState.requestCount++
-			workflowState.pendingUpdates++
+			workflowState.IncrementRequestCount()
+			workflowState.IncrementPendingUpdates()
 			defer func() {
-				workflowState.pendingUpdates--
+				workflowState.DecrementPendingUpdates()
 			}()
 
-			logger.Info("🔢 Processing request", "requestCount", workflowState.requestCount, "idempotencyKey", requestCtx.GetIdempotencyKey())
+			logger.Info("🔢 Processing request", "requestCount", workflowState.GetRequestCount(), "idempotencyKey", requestCtx.GetIdempotencyKey())
 			
 			// ✅ Increment internal sequence number for this event (preserved across continue-as-new)
-			workflowState.sequenceNumber++
+			sequenceNumber := workflowState.IncrementSequenceNumber()
 			
-			logger.Info("📦 Creating typed event envelope", "sequenceNumber", workflowState.sequenceNumber)
+			logger.Info("📦 Creating typed event envelope", "sequenceNumber", sequenceNumber)
 			// Create typed event envelope (passing nil for metadata for now)
 			envelope, err := engines.NewTypedEventEnvelope(
-				workflowState.sequenceNumber,
+				sequenceNumber,
 				fmt.Sprintf("%s.event", entityType),
 				timestamppb.New(workflow.Now(ctx)),
 				event,
@@ -459,7 +302,7 @@ func EntityWorkflow[TState, TEvent, TTransitionInfo proto.Message](
 			
 			// ✅ Mark request as processed for idempotency (if we have request context)
 			if requestCtx != nil && requestCtx.IdempotencyKey != "" {
-				workflowState.markRequestProcessed(ctx, requestCtx.IdempotencyKey)
+				workflowState.MarkRequestProcessed(ctx, requestCtx.IdempotencyKey)
 			}
 			
 			// Log transition info for debugging/monitoring
@@ -474,7 +317,7 @@ func EntityWorkflow[TState, TEvent, TTransitionInfo proto.Message](
 		workflow.UpdateHandlerOptions{
 			// ✅ Validator prevents updates during continue-as-new
 			Validator: func(ctx workflow.Context, requestCtx *entityv1.RequestContext, event TEvent) error {
-				if workflowState.requestCount >= workflowState.requestsBeforeCAN {
+				if workflowState.GetRequestCount() >= workflowState.GetRequestsBeforeCAN() {
 					return temporal.NewApplicationError("Backoff for continue-as-new", "ErrBackoff")
 				}
 				return nil
@@ -492,27 +335,27 @@ func EntityWorkflow[TState, TEvent, TTransitionInfo proto.Message](
 	// ✅ Main workflow loop with proper continue-as-new logic
 	for {
 		// ✅ Check if we should continue as new
-		if workflowState.shouldContinueAsNew(ctx) {
+		if workflowState.ShouldContinueAsNewWithWorkflowContext(ctx) {
 			logger.Info("🔄 Continue-as-new triggered", 
-				"requestCount", workflowState.requestCount,
-				"pendingUpdates", workflowState.pendingUpdates,
+				"requestCount", workflowState.GetRequestCount(),
+				"pendingUpdates", workflowState.GetPendingUpdates(),
 				"temporalSuggested", workflow.GetInfo(ctx).GetContinueAsNewSuggested())
 			break
 		}
 
 		// Sleep indefinitely until woken by signals/updates
 		logger.Info("🌙 EntityWorkflow await mode", 
-			"requestCount", workflowState.requestCount,
-			"pendingUpdates", workflowState.pendingUpdates)
+			"requestCount", workflowState.GetRequestCount(),
+			"pendingUpdates", workflowState.GetPendingUpdates())
 		workflow.Await(ctx, func() bool { 
-			return workflowState.shouldContinueAsNew(ctx)
+			return workflowState.ShouldContinueAsNewWithWorkflowContext(ctx)
 		})
 	}
 
 	// ✅ Wait for all pending updates to complete before continuing
-	logger.Info("⏳ Waiting for pending updates to complete", "pendingUpdates", workflowState.pendingUpdates)
+	logger.Info("⏳ Waiting for pending updates to complete", "pendingUpdates", workflowState.GetPendingUpdates())
 	err = workflow.Await(ctx, func() bool {
-		return workflowState.pendingUpdates == 0
+		return workflowState.GetPendingUpdates() == 0
 	})
 	if err != nil {
 		logger.Error("❌ Failed to wait for pending updates", "error", err)
@@ -529,8 +372,8 @@ func EntityWorkflow[TState, TEvent, TTransitionInfo proto.Message](
 	}
 	
 	// ✅ Prepare cutoff for next workflow and create new state with preserved sequence number and metadata
-	cutoffForNext := workflowState.getIdempotencyCutoffForContinuation(ctx)
-	newWorkflowState := NewEntityWorkflowStateForContinuation(cutoffForNext, workflowState.sequenceNumber, workflowState.entityMetadata)
+	cutoffForNext := workflowState.GetIdempotencyCutoffForContinuation(ctx)
+	newWorkflowState := state.NewWorkflowStateForContinuation(cutoffForNext, workflowState.GetSequenceNumber(), workflowState.GetEntityMetadata())
 	
 	// ✅ Continue as new with compressed state and preserved workflow state
 	newParams := EntityWorkflowParams[TState]{
@@ -540,88 +383,19 @@ func EntityWorkflow[TState, TEvent, TTransitionInfo proto.Message](
 	}
 
 	logger.Info("🔄 Continuing as new", 
-		"requestCount", workflowState.requestCount,
-		"sequenceNumber", workflowState.sequenceNumber,
+		"requestCount", workflowState.GetRequestCount(),
+		"sequenceNumber", workflowState.GetSequenceNumber(),
 		"idempotencyCutoff", cutoffForNext)
 
 	return workflow.NewContinueAsNewError(ctx, EntityWorkflow[TState, TEvent, TTransitionInfo], newParams, engine, idHandler)
 }
 
-// ✅ SIMPLIFIED: Remove complex deterministic ID generation
-func (state *EntityWorkflowState) shouldContinueAsNew(ctx workflow.Context) bool {
-	// Use Temporal's built-in suggestion (recommended)
-	if workflow.GetInfo(ctx).GetContinueAsNewSuggested() {
-		return true
-	}
-	
-	// Fallback to request count threshold
-	return state.requestCount >= state.requestsBeforeCAN
-}
+// Continue-as-new logic is now in the state package
 
-// GetEntityTypeFromProtobuf derives the entity type from a protobuf message
-func GetEntityTypeFromProtobuf[T proto.Message]() string {
-	instance := newInstance[T]()
-	descriptor := instance.ProtoReflect().Descriptor()
-	return string(descriptor.FullName())
-}
+// Legacy functions moved to other packages - kept for backward compatibility
+// Note: BuildEntityWorkflowIDFromProtobuf is a generic function and must be called directly from ids package
+var ParseEntityWorkflowID = ids.ParseEntityWorkflowID
+// Note: NewEntityWorkflowStarter is a generic function and must be called directly from utils package
 
-// ✅ SIMPLIFIED: Standard entity workflow ID (no request hashing)
-func BuildEntityWorkflowIDFromProtobuf[T proto.Message](entityID string) string {
-	entityType := GetEntityTypeFromProtobuf[T]()
-	return fmt.Sprintf("%s-%s", entityType, entityID)
-}
-
-// ✅ REMOVED: All the complex deterministic ID generation helpers
-// - BuildDeterministicWorkflowID() 
-// - BuildEntityWorkflowIDFromParts()
-// - Complex parsing logic
-
-// authorizeRequest validates that the RequestContext matches the established EntityMetadata
-func authorizeRequest(requestCtx *entityv1.RequestContext, entityMetadata *entityv1.EntityMetadata) bool {
-	if requestCtx == nil || entityMetadata == nil {
-		return false
-	}
-	
-	// Check all authorization fields must match
-	return requestCtx.OrgId == entityMetadata.OrgId &&
-		   requestCtx.TeamId == entityMetadata.TeamId &&
-		   requestCtx.UserId == entityMetadata.UserId &&
-		   requestCtx.Tenant == entityMetadata.Tenant &&
-		   requestCtx.Environment == entityMetadata.Environment
-}
-
-// Helper function to parse entity workflow ID
-func ParseEntityWorkflowID(workflowID string) (entityType, entityID string, err error) {
-	// This is a simple implementation - you might want more sophisticated parsing
-	// for complex entity types with dots/hyphens
-	parts := strings.SplitN(workflowID, "-", 2)
-	if len(parts) < 2 {
-		return "", "", fmt.Errorf("invalid entity workflow ID format: %s", workflowID)
-	}
-	return parts[0], parts[1], nil
-}
-
-// EntityWorkflowStarter helps start typed entity workflows
-type EntityWorkflowStarter[TState, TEvent, TTransitionInfo proto.Message] struct {
-	Engine    engines.Engine[TState, TEvent, TTransitionInfo]
-	IDHandler WorkflowIDHandler
-}
-
-// NewEntityWorkflowStarter creates a new starter for the given engine type
-func NewEntityWorkflowStarter[TState, TEvent, TTransitionInfo proto.Message](
-	engine engines.Engine[TState, TEvent, TTransitionInfo],
-	idHandler WorkflowIDHandler,
-) *EntityWorkflowStarter[TState, TEvent, TTransitionInfo] {
-	return &EntityWorkflowStarter[TState, TEvent, TTransitionInfo]{
-		Engine:    engine,
-		IDHandler: idHandler,
-	}
-}
-
-// StartWorkflow starts an entity workflow with the given parameters
-func (s *EntityWorkflowStarter[TState, TEvent, TTransitionInfo]) StartWorkflow(
-	ctx workflow.Context,
-	params EntityWorkflowParams[TState],
-) error {
-	return EntityWorkflow[TState, TEvent, TTransitionInfo](ctx, params, s.Engine, s.IDHandler)
-} 
+// EntityWorkflowStarter type alias for backward compatibility
+type EntityWorkflowStarter[TState, TEvent, TTransitionInfo proto.Message] = utils.EntityWorkflowStarter[TState, TEvent, TTransitionInfo] 
