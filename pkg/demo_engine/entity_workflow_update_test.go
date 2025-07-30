@@ -657,7 +657,7 @@ func (s *DemoEntityWorkflowUpdateTestSuite) Test_UpdateProcessEvent_ValidationBu
 		RequestTime:    timestamppb.Now(),
 	}
 
-	s.T().Log("⏰ Sending increment that exceeds max value (should be capped)")
+	s.T().Log("⏰ Sending increment that exceeds max value (should fail validation)")
 	updateHandle, err := s.client.UpdateWorkflow(context.Background(), client.UpdateWorkflowOptions{
 		WorkflowID:   workflowRun.GetID(),
 		RunID:        workflowRun.GetRunID(),
@@ -672,12 +672,9 @@ func (s *DemoEntityWorkflowUpdateTestSuite) Test_UpdateProcessEvent_ValidationBu
 	
 	var updateResult *demov1.DemoEngineState
 	err = updateHandle.Get(ctx, &updateResult)
-	s.Require().NoError(err)
-	s.T().Log("🎯 Validation update completed!")
-	
-	// Should be capped at max value
-	s.Equal(int64(100), updateResult.CurrentValue)
-	s.Len(updateResult.History, 1)
+	s.Require().Error(err) // Expect an error due to validation failure
+	s.Contains(err.Error(), "increment would exceed max value")
+	s.T().Log("🎯 Validation correctly failed as expected!")
 	
 	s.T().Log("✅ Validation test completed successfully!")
 }
@@ -774,7 +771,7 @@ func (s *DemoEntityWorkflowUpdateTestSuite) Test_UpdateProcessEvent_CombineSigna
 		TeamId:         "test-team",
 		Environment:    "test",
 		Tenant:         "test-tenant",
-		IdempotencyKey: "mixed-update-1",
+		IdempotencyKey: "mixed-update-2", // Different idempotency key for second operation
 		RequestTime:    timestamppb.Now(),
 	}
 

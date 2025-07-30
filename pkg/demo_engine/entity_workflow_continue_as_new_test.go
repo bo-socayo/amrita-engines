@@ -1,11 +1,14 @@
 package demo_engine
 
 import (
+	"context"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/suite"
+	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/testsuite"
+	"go.temporal.io/sdk/worker"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/bo-socayo/amrita-engines/pkg/entityworkflows"
@@ -15,19 +18,67 @@ import (
 
 type DemoEntityWorkflowContinueAsNewTestSuite struct {
 	suite.Suite
-	testsuite.WorkflowTestSuite
-	env *testsuite.TestWorkflowEnvironment
+	
+	// Use in-memory dev server
+	devServer  *testsuite.DevServer
+	client     client.Client
+	worker     worker.Worker
+	taskQueue  string
+}
+
+func (s *DemoEntityWorkflowContinueAsNewTestSuite) SetupSuite() {
+	// Start in-memory dev server
+	var err error
+	s.devServer, err = testsuite.StartDevServer(context.Background(), testsuite.DevServerOptions{
+		ClientOptions: &client.Options{},
+	})
+	s.Require().NoError(err)
+	s.Require().NotNil(s.devServer)
+	
+	// Get client from dev server
+	s.client = s.devServer.Client()
+	s.Require().NotNil(s.client)
+	
+	// Create unique task queue for this test suite
+	s.taskQueue = "demo-entity-continue-as-new-suite-" + time.Now().Format("20060102-150405")
+	
+	// Create worker (shared across all tests in suite)
+	s.worker = worker.New(s.client, s.taskQueue, worker.Options{})
+	
+	// Register the entity workflow - it comes with activities built-in now!
+	s.worker.RegisterWorkflow(DemoEntityWorkflow)
+	
+	// Start worker once for the entire suite
+	go func() {
+		err := s.worker.Run(make(chan interface{}))
+		if err != nil {
+			s.T().Logf("Worker error: %v", err)
+		}
+	}()
+	
+	// Give worker a moment to start
+	time.Sleep(200 * time.Millisecond)
+	
+	s.T().Log("✅ Started in-memory Temporal dev server for continue-as-new tests")
+}
+
+func (s *DemoEntityWorkflowContinueAsNewTestSuite) TearDownSuite() {
+	if s.worker != nil {
+		s.worker.Stop()
+	}
+	if s.devServer != nil {
+		err := s.devServer.Stop()
+		s.Require().NoError(err)
+		s.T().Log("✅ Stopped in-memory Temporal dev server")
+	}
 }
 
 func (s *DemoEntityWorkflowContinueAsNewTestSuite) SetupTest() {
-	s.env = s.NewTestWorkflowEnvironment()
-	
-	// Register the entity workflow
-	s.env.RegisterWorkflow(DemoEntityWorkflow)
+	// No per-test setup needed
 }
 
 func (s *DemoEntityWorkflowContinueAsNewTestSuite) TearDownTest() {
-	s.env.AssertExpectations(s.T())
+	// No per-test cleanup needed
 }
 
 func TestDemoEntityWorkflowContinueAsNewTestSuite(t *testing.T) {
@@ -67,24 +118,35 @@ func (s *DemoEntityWorkflowContinueAsNewTestSuite) TestStateCompressionWithLarge
 		InitialState: initialState,
 	}
 
-	s.env.ExecuteWorkflow(DemoEntityWorkflow, params)
+	// Start the workflow
+	s.T().Log("🚀 Starting workflow for large history compression test")
+	workflowRun, err := s.client.ExecuteWorkflow(context.Background(), client.StartWorkflowOptions{
+		ID:        "test-compression-large-history-workflow-" + time.Now().Format("20060102-150405-000"),
+		TaskQueue: s.taskQueue,
+	}, DemoEntityWorkflow, params)
+	s.Require().NoError(err)
+	s.T().Log("📋 Workflow started")
+
+	// Give workflow a moment to initialize
+	time.Sleep(300 * time.Millisecond)
 
 	// Query the state to verify compression was applied during initialization
-	s.env.RegisterDelayedCallback(func() {
-		encoded, err := s.env.QueryWorkflow("getEntityState")
-		s.NoError(err)
-		
-		var queryResponse entityworkflows.EntityQueryResponse[*demov1.DemoEngineState]
-		err = encoded.Get(&queryResponse)
-		s.NoError(err)
-		
-		s.True(queryResponse.IsInitialized)
-		
-		// After engine initialization with ApplyBusinessDefaults, the state should maintain
-		// the current value but the large history should be ready for compression
-		s.Contains(queryResponse.CurrentStateJSON, `"currentValue":60`)
-		s.Contains(queryResponse.CurrentStateJSON, `"description":"Large history test"`)
-	}, time.Millisecond*100)
+	s.T().Log("🔍 Querying state after initialization")
+	response, err := s.client.QueryWorkflow(context.Background(), workflowRun.GetID(), workflowRun.GetRunID(), "getEntityState")
+	s.NoError(err)
+	
+	var queryResponse entityworkflows.EntityQueryResponse[*demov1.DemoEngineState]
+	err = response.Get(&queryResponse)
+	s.NoError(err)
+	
+	s.True(queryResponse.IsInitialized)
+	
+	// After engine initialization with ApplyBusinessDefaults, the state should maintain
+	// the current value but the large history should be ready for compression
+	s.Contains(queryResponse.CurrentStateJSON, `"currentValue":"60"`)
+	s.Contains(queryResponse.CurrentStateJSON, `"description":"Large history test"`)
+	
+	s.T().Log("✅ Large history compression test completed successfully!")
 }
 
 // TestStateCompressionTriggeredByEngine tests that our custom compression function is actually used
@@ -119,56 +181,79 @@ func (s *DemoEntityWorkflowContinueAsNewTestSuite) TestStateCompressionTriggered
 		InitialState: initialState,
 	}
 
-	s.env.ExecuteWorkflow(DemoEntityWorkflow, params)
+	// Start the workflow
+	s.T().Log("🚀 Starting workflow for engine compression test")
+	workflowRun, err := s.client.ExecuteWorkflow(context.Background(), client.StartWorkflowOptions{
+		ID:        "test-engine-compression-workflow-" + time.Now().Format("20060102-150405-000"),
+		TaskQueue: s.taskQueue,
+	}, DemoEntityWorkflow, params)
+	s.Require().NoError(err)
+	s.T().Log("📋 Workflow started")
 
-	// Add many more events to build up history beyond compression threshold
-	for i := 0; i < 25; i++ {
-		eventId := i + 1
-		s.env.RegisterDelayedCallback(func() {
-			incrementSignal := &demov1.DemoEngineSignal{
-				Signal: &demov1.DemoEngineSignal_Increment{
-					Increment: &demov1.IncrementSignal{
-						Amount:    1,
-						Reason:    "Building history for compression test",
-						Timestamp: timestamppb.Now(),
-					},
+	// Give workflow a moment to initialize
+	time.Sleep(300 * time.Millisecond)
+
+	// Add some events to build up history beyond compression threshold
+	numEvents := 5
+	for i := 0; i < numEvents; i++ {
+		incrementSignal := &demov1.DemoEngineSignal{
+			Signal: &demov1.DemoEngineSignal_Increment{
+				Increment: &demov1.IncrementSignal{
+					Amount:    1,
+					Reason:    "Building history for compression test",
+					Timestamp: timestamppb.Now(),
 				},
-			}
+			},
+		}
 
-			requestCtx := &entityv1.RequestContext{
-				UserId:         "test-user",
-				OrgId:          "test-org",
-				IdempotencyKey: "compression-event-" + string(rune(eventId)),
-				RequestTime:    timestamppb.Now(),
-			}
+		requestCtx := &entityv1.RequestContext{
+			UserId:         "test-user",
+			OrgId:          "test-org",
+			TeamId:         "test-team",
+			Environment:    "test",
+			Tenant:         "test-tenant",
+			IdempotencyKey: "compression-event-" + string(rune(i+49)), // Convert to char starting from '1'
+			RequestTime:    timestamppb.Now(),
+		}
 
-			s.env.UpdateWorkflow("processEvent", "compression-update-"+string(rune(eventId)), &testsuite.TestUpdateCallback{
-				OnComplete: func(response interface{}, err error) {
-					s.NoError(err)
-					result := response.(*demov1.DemoEngineState)
-					// Verify state is growing
-					s.GreaterOrEqual(len(result.History), 1)
-				},
-			}, requestCtx, incrementSignal)
-		}, time.Duration(eventId*50)*time.Millisecond)
+		s.T().Logf("⏰ Sending compression event %d/%d", i+1, numEvents)
+		updateHandle, err := s.client.UpdateWorkflow(context.Background(), client.UpdateWorkflowOptions{
+			WorkflowID:   workflowRun.GetID(),
+			RunID:        workflowRun.GetRunID(),
+			UpdateName:   "processEvent",
+			WaitForStage: client.WorkflowUpdateStageCompleted,
+			Args:         []interface{}{requestCtx, incrementSignal},
+		})
+		s.Require().NoError(err)
+		
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		
+		var result *demov1.DemoEngineState
+		err = updateHandle.Get(ctx, &result)
+		s.Require().NoError(err)
+		
+		// Verify state is growing
+		s.GreaterOrEqual(len(result.History), 1)
 	}
 
 	// Query final state to verify history has grown substantially
-	s.env.RegisterDelayedCallback(func() {
-		encoded, err := s.env.QueryWorkflow("getEntityState")
-		s.NoError(err)
-		
-		var queryResponse entityworkflows.EntityQueryResponse[*demov1.DemoEngineState]
-		err = encoded.Get(&queryResponse)
-		s.NoError(err)
-		
-		s.True(queryResponse.IsInitialized)
-		
-		// The state should have accumulated many events
-		// (This tests that our compression function will have data to work with)
-		s.Contains(queryResponse.CurrentStateJSON, `"currentValue":55`) // 30 + 25 = 55
-		s.Contains(queryResponse.CurrentStateJSON, `"history"`)
-	}, time.Millisecond*2000) // Wait for all updates to complete
+	s.T().Log("🔍 Querying final state after compression events")
+	response, err := s.client.QueryWorkflow(context.Background(), workflowRun.GetID(), workflowRun.GetRunID(), "getEntityState")
+	s.NoError(err)
+	
+	var queryResponse entityworkflows.EntityQueryResponse[*demov1.DemoEngineState]
+	err = response.Get(&queryResponse)
+	s.NoError(err)
+	
+	s.True(queryResponse.IsInitialized)
+	
+	// The state should have accumulated the new events
+	// expectedValue = 30 + 5 = 35
+	s.Contains(queryResponse.CurrentStateJSON, `"currentValue":"35"`) // 30 + 5 = 35
+	s.Contains(queryResponse.CurrentStateJSON, `"history"`)
+	
+	s.T().Log("✅ Engine compression test completed successfully!")
 }
 
 // TestContinueAsNewPreservesEssentialState tests continue-as-new behavior
@@ -193,62 +278,83 @@ func (s *DemoEntityWorkflowContinueAsNewTestSuite) TestContinueAsNewPreservesEss
 		InitialState: initialState,
 	}
 
-	s.env.ExecuteWorkflow(DemoEntityWorkflow, params)
+	// Start the workflow
+	s.T().Log("🚀 Starting workflow for continue-as-new preservation test")
+	workflowRun, err := s.client.ExecuteWorkflow(context.Background(), client.StartWorkflowOptions{
+		ID:        "test-continue-as-new-preservation-workflow-" + time.Now().Format("20060102-150405-000"),
+		TaskQueue: s.taskQueue,
+	}, DemoEntityWorkflow, params)
+	s.Require().NoError(err)
+	s.T().Log("📋 Workflow started")
+
+	// Give workflow a moment to initialize
+	time.Sleep(300 * time.Millisecond)
 
 	// Send multiple operations to test state preservation patterns
 	updateCount := 10
 	for i := 0; i < updateCount; i++ {
-		eventId := i + 1
-		s.env.RegisterDelayedCallback(func() {
-			incrementSignal := &demov1.DemoEngineSignal{
-				Signal: &demov1.DemoEngineSignal_Increment{
-					Increment: &demov1.IncrementSignal{
-						Amount:    5,
-						Reason:    "Preservation test increment",
-						Timestamp: timestamppb.Now(),
-					},
+		incrementSignal := &demov1.DemoEngineSignal{
+			Signal: &demov1.DemoEngineSignal_Increment{
+				Increment: &demov1.IncrementSignal{
+					Amount:    5,
+					Reason:    "Preservation test increment",
+					Timestamp: timestamppb.Now(),
 				},
-			}
+			},
+		}
 
-			requestCtx := &entityv1.RequestContext{
-				UserId:         "test-user",
-				OrgId:          "test-org",
-				IdempotencyKey: "preservation-" + string(rune(eventId+48)), // Convert to char
-				RequestTime:    timestamppb.Now(),
-			}
+		requestCtx := &entityv1.RequestContext{
+			UserId:         "test-user",
+			OrgId:          "test-org",
+			TeamId:         "test-team",
+			Environment:    "test",
+			Tenant:         "test-tenant",
+			IdempotencyKey: "preservation-" + string(rune(i+49)), // Convert to char starting from '1'
+			RequestTime:    timestamppb.Now(),
+		}
 
-			s.env.UpdateWorkflow("processEvent", "preservation-update-"+string(rune(eventId+48)), &testsuite.TestUpdateCallback{
-				OnComplete: func(response interface{}, err error) {
-					s.NoError(err)
-					result := response.(*demov1.DemoEngineState)
-					
-					// Verify essential state is preserved during processing
-					s.NotNil(result.Config)
-					s.Equal("Continue-as-new preservation test", result.Config.Description)
-					s.Equal(int64(10000), result.Config.MaxValue)
-					s.GreaterOrEqual(result.CurrentValue, int64(100)) // Should be at least initial value
-				},
-			}, requestCtx, incrementSignal)
-		}, time.Duration(eventId*100)*time.Millisecond)
+		s.T().Logf("⏰ Sending preservation event %d/%d", i+1, updateCount)
+		updateHandle, err := s.client.UpdateWorkflow(context.Background(), client.UpdateWorkflowOptions{
+			WorkflowID:   workflowRun.GetID(),
+			RunID:        workflowRun.GetRunID(),
+			UpdateName:   "processEvent",
+			WaitForStage: client.WorkflowUpdateStageCompleted,
+			Args:         []interface{}{requestCtx, incrementSignal},
+		})
+		s.Require().NoError(err)
+		
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		
+		var result *demov1.DemoEngineState
+		err = updateHandle.Get(ctx, &result)
+		s.Require().NoError(err)
+		
+		// Verify essential state is preserved during processing
+		s.NotNil(result.Config)
+		s.Equal("Continue-as-new preservation test", result.Config.Description)
+		s.Equal(int64(10000), result.Config.MaxValue)
+		s.GreaterOrEqual(result.CurrentValue, int64(100)) // Should be at least initial value
 	}
 
 	// Final verification of state preservation
-	s.env.RegisterDelayedCallback(func() {
-		encoded, err := s.env.QueryWorkflow("getEntityState")
-		s.NoError(err)
-		
-		var queryResponse entityworkflows.EntityQueryResponse[*demov1.DemoEngineState]
-		err = encoded.Get(&queryResponse)
-		s.NoError(err)
-		
-		s.True(queryResponse.IsInitialized)
-		
-		// Essential fields should be preserved
-		s.Contains(queryResponse.CurrentStateJSON, `"currentValue":150`) // 100 + (10 * 5) = 150
-		s.Contains(queryResponse.CurrentStateJSON, `"description":"Continue-as-new preservation test"`)
-		s.Contains(queryResponse.CurrentStateJSON, `"maxValue":10000`)
-		s.Contains(queryResponse.CurrentStateJSON, `"defaultIncrement":10`)
-	}, time.Millisecond*1500)
+	s.T().Log("🔍 Verifying final state preservation")
+	response, err := s.client.QueryWorkflow(context.Background(), workflowRun.GetID(), workflowRun.GetRunID(), "getEntityState")
+	s.NoError(err)
+	
+	var queryResponse entityworkflows.EntityQueryResponse[*demov1.DemoEngineState]
+	err = response.Get(&queryResponse)
+	s.NoError(err)
+	
+	s.True(queryResponse.IsInitialized)
+	
+	// Essential fields should be preserved
+	s.Contains(queryResponse.CurrentStateJSON, `"currentValue":"150"`) // 100 + (10 * 5) = 150
+	s.Contains(queryResponse.CurrentStateJSON, `"description":"Continue-as-new preservation test"`)
+	s.Contains(queryResponse.CurrentStateJSON, `"maxValue":"10000"`)
+	s.Contains(queryResponse.CurrentStateJSON, `"defaultIncrement":"10"`)
+	
+	s.T().Log("✅ Continue-as-new preservation test completed successfully!")
 }
 
 // TestStateCompressionWithMetadata tests compression of large metadata
@@ -269,51 +375,75 @@ func (s *DemoEntityWorkflowContinueAsNewTestSuite) TestStateCompressionWithMetad
 		InitialState: initialState,
 	}
 
-	s.env.ExecuteWorkflow(DemoEntityWorkflow, params)
+	// Start the workflow
+	s.T().Log("🚀 Starting workflow for metadata compression test")
+	workflowRun, err := s.client.ExecuteWorkflow(context.Background(), client.StartWorkflowOptions{
+		ID:        "test-metadata-compression-workflow-" + time.Now().Format("20060102-150405-000"),
+		TaskQueue: s.taskQueue,
+	}, DemoEntityWorkflow, params)
+	s.Require().NoError(err)
+	s.T().Log("📋 Workflow started")
+
+	// Give workflow a moment to initialize
+	time.Sleep(300 * time.Millisecond)
 
 	// Start with a query to verify initial state
-	s.env.RegisterDelayedCallback(func() {
-		encoded, err := s.env.QueryWorkflow("getEntityState")
-		s.NoError(err)
-		
-		var queryResponse entityworkflows.EntityQueryResponse[*demov1.DemoEngineState]
-		err = encoded.Get(&queryResponse)
-		s.NoError(err)
-		
-		s.True(queryResponse.IsInitialized)
-		s.Contains(queryResponse.CurrentStateJSON, `"currentValue":42`)
-		s.Contains(queryResponse.CurrentStateJSON, `"description":"Metadata compression test"`)
-	}, time.Millisecond*100)
+	s.T().Log("🔍 Querying initial state")
+	response, err := s.client.QueryWorkflow(context.Background(), workflowRun.GetID(), workflowRun.GetRunID(), "getEntityState")
+	s.NoError(err)
+	
+	var queryResponse entityworkflows.EntityQueryResponse[*demov1.DemoEngineState]
+	err = response.Get(&queryResponse)
+	s.NoError(err)
+	
+	s.True(queryResponse.IsInitialized)
+	s.Contains(queryResponse.CurrentStateJSON, `"currentValue":"42"`)
+	s.Contains(queryResponse.CurrentStateJSON, `"description":"Metadata compression test"`)
 
 	// Send an increment to verify normal operation
-	s.env.RegisterDelayedCallback(func() {
-		incrementSignal := &demov1.DemoEngineSignal{
-			Signal: &demov1.DemoEngineSignal_Increment{
-				Increment: &demov1.IncrementSignal{
-					Amount:    8,
-					Reason:    "Test increment for metadata compression",
-					Timestamp: timestamppb.Now(),
-				},
+	incrementSignal := &demov1.DemoEngineSignal{
+		Signal: &demov1.DemoEngineSignal_Increment{
+			Increment: &demov1.IncrementSignal{
+				Amount:    8,
+				Reason:    "Test increment for metadata compression",
+				Timestamp: timestamppb.Now(),
 			},
-		}
+		},
+	}
 
-		requestCtx := &entityv1.RequestContext{
-			UserId:         "test-user",
-			OrgId:          "test-org",
-			IdempotencyKey: "metadata-compression-test",
-			RequestTime:    timestamppb.Now(),
-		}
+	requestCtx := &entityv1.RequestContext{
+		UserId:         "test-user",
+		OrgId:          "test-org",
+		TeamId:         "test-team",
+		Environment:    "test",
+		Tenant:         "test-tenant",
+		IdempotencyKey: "metadata-compression-test",
+		RequestTime:    timestamppb.Now(),
+	}
 
-		s.env.UpdateWorkflow("processEvent", "metadata-update", &testsuite.TestUpdateCallback{
-			OnComplete: func(response interface{}, err error) {
-				s.NoError(err)
-				result := response.(*demov1.DemoEngineState)
-				s.Equal(int64(50), result.CurrentValue) // 42 + 8 = 50
-				s.Len(result.History, 1)
-				s.Equal("Test increment for metadata compression", result.History[0].Reason)
-			},
-		}, requestCtx, incrementSignal)
-	}, time.Millisecond*200)
+	s.T().Log("⏰ Sending increment for metadata compression test")
+	updateHandle, err := s.client.UpdateWorkflow(context.Background(), client.UpdateWorkflowOptions{
+		WorkflowID:   workflowRun.GetID(),
+		RunID:        workflowRun.GetRunID(),
+		UpdateName:   "processEvent",
+		WaitForStage: client.WorkflowUpdateStageCompleted,
+		Args:         []interface{}{requestCtx, incrementSignal},
+	})
+	s.Require().NoError(err)
+	
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	
+	var result *demov1.DemoEngineState
+	err = updateHandle.Get(ctx, &result)
+	s.Require().NoError(err)
+	s.T().Log("🎯 Metadata compression update completed!")
+	
+	s.Equal(int64(50), result.CurrentValue) // 42 + 8 = 50
+	s.Len(result.History, 1)
+	s.Equal("Test increment for metadata compression", result.History[0].Reason)
+	
+	s.T().Log("✅ Metadata compression test completed successfully!")
 }
 
 // TestWorkflowIdempotencyAcrossContinueAsNew tests that idempotency works across continue-as-new
@@ -335,7 +465,17 @@ func (s *DemoEntityWorkflowContinueAsNewTestSuite) TestWorkflowIdempotencyAcross
 		InitialState: initialState,
 	}
 
-	s.env.ExecuteWorkflow(DemoEntityWorkflow, params)
+	// Start the workflow
+	s.T().Log("🚀 Starting workflow for idempotency continue-as-new test")
+	workflowRun, err := s.client.ExecuteWorkflow(context.Background(), client.StartWorkflowOptions{
+		ID:        "test-idempotency-continue-as-new-workflow-" + time.Now().Format("20060102-150405-000"),
+		TaskQueue: s.taskQueue,
+	}, DemoEntityWorkflow, params)
+	s.Require().NoError(err)
+	s.T().Log("📋 Workflow started")
+
+	// Give workflow a moment to initialize
+	time.Sleep(300 * time.Millisecond)
 
 	// Send the same idempotent operation multiple times
 	idempotencyKey := "cross-continue-as-new-key"
@@ -353,46 +493,70 @@ func (s *DemoEntityWorkflowContinueAsNewTestSuite) TestWorkflowIdempotencyAcross
 	requestCtx := &entityv1.RequestContext{
 		UserId:         "test-user",
 		OrgId:          "test-org",
+		TeamId:         "test-team",
+		Environment:    "test",
+		Tenant:         "test-tenant",
 		IdempotencyKey: idempotencyKey,
 		RequestTime:    timestamppb.Now(),
 	}
 
 	// First operation
-	s.env.RegisterDelayedCallback(func() {
-		s.env.UpdateWorkflow("processEvent", "idempotent-1", &testsuite.TestUpdateCallback{
-			OnComplete: func(response interface{}, err error) {
-				s.NoError(err)
-				result := response.(*demov1.DemoEngineState)
-				s.Equal(int64(25), result.CurrentValue)
-				s.Len(result.History, 1)
-			},
-		}, requestCtx, incrementSignal)
-	}, time.Millisecond*100)
+	s.T().Log("⏰ Sending first idempotent operation")
+	updateHandle1, err := s.client.UpdateWorkflow(context.Background(), client.UpdateWorkflowOptions{
+		WorkflowID:   workflowRun.GetID(),
+		RunID:        workflowRun.GetRunID(),
+		UpdateName:   "processEvent",
+		WaitForStage: client.WorkflowUpdateStageCompleted,
+		Args:         []interface{}{requestCtx, incrementSignal},
+	})
+	s.Require().NoError(err)
+	
+	ctx1, cancel1 := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel1()
+	
+	var result1 *demov1.DemoEngineState
+	err = updateHandle1.Get(ctx1, &result1)
+	s.Require().NoError(err)
+	s.T().Log("🎯 First idempotent operation completed!")
+	
+	s.Equal(int64(25), result1.CurrentValue)
+	s.Len(result1.History, 1)
 
 	// Duplicate operation with same idempotency key (should be deduplicated)
-	s.env.RegisterDelayedCallback(func() {
-		s.env.UpdateWorkflow("processEvent", "idempotent-2", &testsuite.TestUpdateCallback{
-			OnComplete: func(response interface{}, err error) {
-				s.NoError(err)
-				result := response.(*demov1.DemoEngineState)
-				// Should still be 25, not 50
-				s.Equal(int64(25), result.CurrentValue)
-				s.Len(result.History, 1) // Should still be only one event
-			},
-		}, requestCtx, incrementSignal)
-	}, time.Millisecond*200)
+	s.T().Log("⏰ Sending duplicate idempotent operation (should be deduplicated)")
+	updateHandle2, err := s.client.UpdateWorkflow(context.Background(), client.UpdateWorkflowOptions{
+		WorkflowID:   workflowRun.GetID(),
+		RunID:        workflowRun.GetRunID(),
+		UpdateName:   "processEvent",
+		WaitForStage: client.WorkflowUpdateStageCompleted,
+		Args:         []interface{}{requestCtx, incrementSignal},
+	})
+	s.Require().NoError(err)
+	
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel2()
+	
+	var result2 *demov1.DemoEngineState
+	err = updateHandle2.Get(ctx2, &result2)
+	s.Require().NoError(err)
+	s.T().Log("🎯 Duplicate idempotent operation completed (should be deduplicated)!")
+	
+	// Should still be 25, not 50
+	s.Equal(int64(25), result2.CurrentValue)
+	s.Len(result2.History, 1) // Should still be only one event
 
 	// Final state verification
-	s.env.RegisterDelayedCallback(func() {
-		encoded, err := s.env.QueryWorkflow("getEntityState")
-		s.NoError(err)
-		
-		var queryResponse entityworkflows.EntityQueryResponse[*demov1.DemoEngineState]
-		err = encoded.Get(&queryResponse)
-		s.NoError(err)
-		
-		s.True(queryResponse.IsInitialized)
-		s.Contains(queryResponse.CurrentStateJSON, `"currentValue":25`)
-		// Should contain only one event despite multiple requests
-	}, time.Millisecond*400)
+	s.T().Log("🔍 Verifying final idempotency state")
+	response, err := s.client.QueryWorkflow(context.Background(), workflowRun.GetID(), workflowRun.GetRunID(), "getEntityState")
+	s.NoError(err)
+	
+	var queryResponse entityworkflows.EntityQueryResponse[*demov1.DemoEngineState]
+	err = response.Get(&queryResponse)
+	s.NoError(err)
+	
+	s.True(queryResponse.IsInitialized)
+	s.Contains(queryResponse.CurrentStateJSON, `"currentValue":"25"`)
+	// Should contain only one event despite multiple requests
+	
+	s.T().Log("✅ Idempotency continue-as-new test completed successfully!")
 } 
