@@ -7,6 +7,7 @@ toolchain go1.24.5
 require (
 	buf.build/gen/go/bufbuild/protovalidate/protocolbuffers/go v1.36.6-20250717165733-d22d418d82d8.1
 	buf.build/go/protovalidate v0.14.0
+	github.com/stretchr/testify v1.10.0
 	go.temporal.io/sdk v1.35.0
 	google.golang.org/protobuf v1.36.6
 )
@@ -27,7 +28,6 @@ require (
 	github.com/robfig/cron v1.2.0 // indirect
 	github.com/stoewer/go-strcase v1.3.0 // indirect
 	github.com/stretchr/objx v0.5.2 // indirect
-	github.com/stretchr/testify v1.10.0 // indirect
 	go.temporal.io/api v1.49.1 // indirect
 	golang.org/x/exp v0.0.0-20240325151524-a685a6edb6d8 // indirect
 	golang.org/x/net v0.39.0 // indirect

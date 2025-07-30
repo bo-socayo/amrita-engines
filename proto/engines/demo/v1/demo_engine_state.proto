@@ -1,0 +1,55 @@
+syntax = "proto3";
+
+package engines.demo.v1;
+
+import "google/protobuf/any.proto";
+import "google/protobuf/timestamp.proto";
+import "buf/validate/validate.proto";
+
+option go_package = "github.com/bo-socayo/amrita-engines/gen/engines/demo/v1;demov1";
+
+// Main demo engine state
+message DemoEngineState {
+  int64 current_value = 1 [(buf.validate.field).int64.gte = 0];
+  DemoConfig config = 2 [(buf.validate.field).required = true];
+  repeated CounterEvent history = 3;
+  google.protobuf.Timestamp last_updated = 4;
+  map<string, google.protobuf.Any> metadata = 5;
+  int64 next_event_id = 6 [(buf.validate.field).int64.gte = 1];
+}
+
+// Configuration for the demo engine
+message DemoConfig {
+  int64 max_value = 1 [(buf.validate.field).int64.gte = 0];  // 0 means no limit
+  int64 default_increment = 2 [(buf.validate.field).int64.gte = 1];
+  bool allow_negative = 3;
+  string description = 4 [(buf.validate.field).string.max_len = 255];
+}
+
+// Historical event tracking
+message CounterEvent {
+  int64 event_id = 1 [(buf.validate.field).int64.gte = 1];
+  CounterEventType type = 2 [(buf.validate.field).enum.defined_only = true];
+  int64 value_change = 3;
+  int64 previous_value = 4;
+  int64 new_value = 5;
+  google.protobuf.Timestamp timestamp = 6 [(buf.validate.field).required = true];
+  string reason = 7 [(buf.validate.field).string.max_len = 255];
+}
+
+// Types of counter events
+enum CounterEventType {
+  COUNTER_EVENT_TYPE_UNSPECIFIED = 0;
+  COUNTER_EVENT_TYPE_INCREMENT = 1;
+  COUNTER_EVENT_TYPE_RESET = 2;
+  COUNTER_EVENT_TYPE_CONFIG_UPDATE = 3;
+}
+
+// Transition information for demo engine
+message DemoEngineTransitionInfo {
+  CounterEvent event_triggered = 1;
+  bool validation_passed = 2;
+  string validation_message = 3;
+  int64 events_count_before = 4;
+  int64 events_count_after = 5;
+} 

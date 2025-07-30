@@ -1,0 +1,38 @@
+syntax = "proto3";
+
+package engines.demo.v1;
+
+import "google/protobuf/timestamp.proto";
+import "engines/demo/v1/demo_engine_state.proto";
+import "buf/validate/validate.proto";
+
+option go_package = "github.com/bo-socayo/amrita-engines/gen/engines/demo/v1;demov1";
+
+// Main demo engine signal using oneof for type safety
+message DemoEngineSignal {
+  oneof signal {
+    IncrementSignal increment = 1;
+    ResetSignal reset = 2;
+    UpdateConfigSignal update_config = 3;
+  }
+}
+
+// Signal to increment the counter
+message IncrementSignal {
+  int64 amount = 1 [(buf.validate.field).int64.gte = 1];
+  string reason = 2 [(buf.validate.field).string.max_len = 255];
+  google.protobuf.Timestamp timestamp = 3 [(buf.validate.field).required = true];
+}
+
+// Signal to reset the counter to zero
+message ResetSignal {
+  string reason = 1 [(buf.validate.field).string.max_len = 255];
+  google.protobuf.Timestamp timestamp = 2 [(buf.validate.field).required = true];
+}
+
+// Signal to update engine configuration
+message UpdateConfigSignal {
+  DemoConfig config = 1 [(buf.validate.field).required = true];
+  string reason = 2 [(buf.validate.field).string.max_len = 255];
+  google.protobuf.Timestamp timestamp = 3 [(buf.validate.field).required = true];
+} 
