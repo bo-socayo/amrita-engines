@@ -12,6 +12,7 @@ import (
 	"github.com/bo-socayo/amrita-engines/pkg/entityworkflows/handlers"
 	"github.com/bo-socayo/amrita-engines/pkg/entityworkflows/ids"
 	"github.com/bo-socayo/amrita-engines/pkg/entityworkflows/state"
+	"github.com/bo-socayo/amrita-engines/pkg/entityworkflows/storage"
 	"github.com/bo-socayo/amrita-engines/pkg/entityworkflows/utils"
 	entityv1 "github.com/bo-socayo/amrita-engines/gen/entity/v1"
 	"go.temporal.io/sdk/temporal"
@@ -44,6 +45,75 @@ func EntityWorkflow[TState, TEvent, TTransitionInfo proto.Message](
 	
 	// Auto-derive entity type from the engine's state protobuf type
 	entityType := ids.GetEntityTypeFromProtobuf[TState]()
+	
+	// Create local ProcessEventActivity with engine captured (NO GLOBAL REGISTRY!)
+	localProcessEventActivity := func(ctx context.Context, input activities.ProcessEventActivityInput[TEvent]) (*activities.ProcessEventActivityResult, error) {
+		// Deserialize current state
+		var currentState TState
+		if len(input.CurrentState) > 0 {
+			currentState = utils.NewInstance[TState]()
+			if err := proto.Unmarshal(input.CurrentState, currentState); err != nil {
+				return &activities.ProcessEventActivityResult{
+					Success:        false,
+					ErrorMessage:   fmt.Sprintf("failed to deserialize current state: %v", err),
+					SequenceNumber: input.SequenceNumber,
+				}, nil
+			}
+		} else {
+			currentState = utils.NewInstance[TState]()
+		}
+
+		// Use the engine instance directly that was passed to the workflow
+		// Each activity execution works with the same engine instance
+		
+		// Initialize engine with current state if not already initialized
+		if !engine.IsInitialized() {
+			_, err := engine.SetInitialState(ctx, currentState, input.CreatedAt)
+			if err != nil {
+				return &activities.ProcessEventActivityResult{
+					Success:        false,
+					ErrorMessage:   fmt.Sprintf("engine initialization failed: %v", err),
+					SequenceNumber: input.SequenceNumber,
+				}, nil
+			}
+		}
+
+		// Process event through the injected engine
+		newState, transitionInfo, err := engine.ProcessEvent(ctx, input.EventEnvelope)
+		if err != nil {
+			return &activities.ProcessEventActivityResult{
+				Success:        false,
+				ErrorMessage:   fmt.Sprintf("engine processing failed: %v", err),
+				SequenceNumber: input.SequenceNumber,
+			}, nil
+		}
+
+		// Serialize results
+		newStateBytes, err := proto.Marshal(newState)
+		if err != nil {
+			return &activities.ProcessEventActivityResult{
+				Success:        false,
+				ErrorMessage:   fmt.Sprintf("failed to serialize new state: %v", err),
+				SequenceNumber: input.SequenceNumber,
+			}, nil
+		}
+
+		transitionInfoBytes, err := proto.Marshal(transitionInfo)
+		if err != nil {
+			return &activities.ProcessEventActivityResult{
+				Success:        false,
+				ErrorMessage:   fmt.Sprintf("failed to serialize transition info: %v", err),
+				SequenceNumber: input.SequenceNumber,
+			}, nil
+		}
+
+		return &activities.ProcessEventActivityResult{
+			Success:        true,
+			NewState:       newStateBytes,
+			TransitionInfo: transitionInfoBytes,
+			SequenceNumber: input.SequenceNumber,
+		}, nil
+	}
 	
 	logger.Info("🚀 EntityWorkflow starting", "entityId", params.EntityId, "entityType", entityType)
 
@@ -288,7 +358,7 @@ func EntityWorkflow[TState, TEvent, TTransitionInfo proto.Message](
 			
 			// Execute blocking local activity
 			var activityResult activities.ProcessEventActivityResult
-			err = workflow.ExecuteLocalActivity(ctx, activities.ProcessEventActivity[TState, TEvent, TTransitionInfo], activityInput).Get(ctx, &activityResult)
+			err = workflow.ExecuteLocalActivity(ctx, localProcessEventActivity, activityInput).Get(ctx, &activityResult)
 			if err != nil {
 				logger.Error("❌ Engine activity execution failed", "error", err)
 				return zero, fmt.Errorf("engine activity failed: %w", err)
@@ -307,6 +377,59 @@ func EntityWorkflow[TState, TEvent, TTransitionInfo proto.Message](
 					"received", activityResult.SequenceNumber)
 				return zero, fmt.Errorf("sequence number mismatch: expected %d, got %d", 
 					sequenceNumber, activityResult.SequenceNumber)
+			}
+			
+			// [NEW] Store to storage adapter if configured (non-blocking with future)
+			var storageFuture workflow.Future
+			if storage.HasStorageAdapter(entityType) {
+				storageInput := activities.StoreEntityWorkflowRecordInput[TEvent]{
+					EntityID:             params.EntityId,
+					EntityType:           entityType,
+					SequenceNumber:       sequenceNumber,
+					EventTime:            envelope.Timestamp.AsTime(),
+					OrgID:                entityMetadata.GetOrgId(),
+					TeamID:               entityMetadata.GetTeamId(),
+					UserID:               entityMetadata.GetUserId(),
+					Tenant:               entityMetadata.GetTenant(),
+					CurrentState:         activityResult.NewState,
+					PreviousState:        currentStateBytes,
+					StateTypeName:        getStateTypeName[TState](),
+					EventEnvelope:        envelope,
+					TransitionInfo:       activityResult.TransitionInfo,
+					EventTypeName:        getEventTypeName[TEvent](),
+					IdempotencyKey:       requestCtx.GetIdempotencyKey(),
+					WorkflowID:           workflow.GetInfo(ctx).WorkflowExecution.ID,
+					RunID:                workflow.GetInfo(ctx).WorkflowExecution.RunID,
+					BusinessLogicVersion: "1.0.0", // TODO: Get from engine
+				}
+				
+				// Configure storage activity options (more lenient since storage is not critical)
+				storageActivityOptions := workflow.LocalActivityOptions{
+					ScheduleToCloseTimeout: 10 * time.Second,
+					RetryPolicy: &temporal.RetryPolicy{
+						InitialInterval:    200 * time.Millisecond,
+						BackoffCoefficient: 2.0,
+						MaximumInterval:    10 * time.Second,
+						MaximumAttempts:    5, // More retries for storage
+					},
+				}
+				
+				storageCtx := workflow.WithLocalActivityOptions(ctx, storageActivityOptions)
+				
+				// Execute storage activity asynchronously (non-blocking)
+				storageFuture = workflow.ExecuteLocalActivity(storageCtx, activities.StoreEntityWorkflowRecordActivity[TEvent], storageInput)
+				
+				// Optionally handle the future in the background (don't block workflow)
+				workflow.Go(ctx, func(ctx workflow.Context) {
+					var storageResult activities.StoreEntityWorkflowRecordResult
+					if err := storageFuture.Get(ctx, &storageResult); err != nil {
+						logger.Warn("⚠️ Storage activity failed", "error", err)
+					} else if !storageResult.Success {
+						logger.Warn("⚠️ Storage operation failed", "error", storageResult.ErrorMessage)
+					} else {
+						logger.Debug("✅ Entity workflow record stored successfully")
+					}
+				})
 			}
 			
 			// Deserialize new state from activity result
@@ -424,4 +547,14 @@ var ParseEntityWorkflowID = ids.ParseEntityWorkflowID
 // Note: NewEntityWorkflowStarter is a generic function and must be called directly from utils package
 
 // EntityWorkflowStarter type alias for backward compatibility
-type EntityWorkflowStarter[TState, TEvent, TTransitionInfo proto.Message] = utils.EntityWorkflowStarter[TState, TEvent, TTransitionInfo] 
+type EntityWorkflowStarter[TState, TEvent, TTransitionInfo proto.Message] = utils.EntityWorkflowStarter[TState, TEvent, TTransitionInfo]
+
+// getStateTypeName extracts the protobuf type name for the state
+func getStateTypeName[TState proto.Message]() string {
+	return string(utils.NewInstance[TState]().ProtoReflect().Descriptor().Name())
+}
+
+// getEventTypeName extracts the protobuf type name for the event
+func getEventTypeName[TEvent proto.Message]() string {
+	return string(utils.NewInstance[TEvent]().ProtoReflect().Descriptor().Name())
+} 
