@@ -4,8 +4,10 @@ import (
 	"context"
 	"fmt"
 	"reflect"
+	"time"
 
 	"github.com/bo-socayo/amrita-engines/pkg/engines"
+	"github.com/bo-socayo/amrita-engines/pkg/entityworkflows/activities"
 	"github.com/bo-socayo/amrita-engines/pkg/entityworkflows/auth"
 	"github.com/bo-socayo/amrita-engines/pkg/entityworkflows/handlers"
 	"github.com/bo-socayo/amrita-engines/pkg/entityworkflows/ids"
@@ -144,9 +146,6 @@ func EntityWorkflow[TState, TEvent, TTransitionInfo proto.Message](
 		return response, nil
 	})
 
-	// ✅ Create update handler instance
-	updateHandler := handlers.NewEntityUpdateHandler[TState, TEvent, TTransitionInfo](engine, entityType)
-
 	// ✅ Register update handler with proper authorization and RequestContext
 	err = workflow.SetUpdateHandlerWithOptions(ctx, "processEvent", 
 		func(ctx workflow.Context, requestCtx *entityv1.RequestContext, event TEvent) (TState, error) {
@@ -210,13 +209,6 @@ func EntityWorkflow[TState, TEvent, TTransitionInfo proto.Message](
 				logger.Debug("✅ Authorization validated")
 			}
 
-			// ✅ Acquire mutex for concurrent protection
-			err := stateMutex.Lock(ctx)
-			if err != nil {
-				return zero, err
-			}
-			defer stateMutex.Unlock()
-
 			// ✅ Check idempotency using RequestContext
 			if requestCtx != nil && requestCtx.IdempotencyKey != "" {
 				if workflowState.IsRequestProcessed(ctx, requestCtx.IdempotencyKey, requestCtx.RequestTime.AsTime()) {
@@ -237,11 +229,100 @@ func EntityWorkflow[TState, TEvent, TTransitionInfo proto.Message](
 			// ✅ Increment internal sequence number for this event (preserved across continue-as-new)
 			sequenceNumber := workflowState.IncrementSequenceNumber()
 			
-			// ✅ Use extracted update handler for core event processing
-			newState, transitionInfo, err := updateHandler.ProcessEvent(ctx, event, sequenceNumber)
+			// ✅ DETERMINISTIC: Execute engine processing in LOCAL ACTIVITY
+			// Serialize current state for activity input
+			currentStateBytes, err := proto.Marshal(currentState)
 			if err != nil {
-				logger.Error("❌ Update handler failed", "error", err)
-				return zero, fmt.Errorf("failed to process event: %w", err)
+				logger.Error("❌ Failed to serialize current state for activity", "error", err)
+				return zero, fmt.Errorf("failed to serialize current state: %w", err)
+			}
+			
+			// Create typed event envelope
+			envelope, err := engines.NewTypedEventEnvelope(
+				sequenceNumber,
+				fmt.Sprintf("%s.event", entityType),
+				timestamppb.New(workflow.Now(ctx)),
+				event,
+				nil, // TODO: Convert map[string]string metadata to protobuf
+			)
+			if err != nil {
+				logger.Error("❌ Failed to create event envelope", "error", err)
+				return zero, fmt.Errorf("failed to create event envelope: %w", err)
+			}
+			
+			// ✅ Acquire mutex for concurrent protection
+			// This is a critical section that ensures only one event is processed at a time
+			// It prevents race conditions and ensures deterministic execution
+			// This is a key part of the engine's determinism guarantee
+			err := stateMutex.Lock(ctx)
+			if err != nil {
+				return zero, err
+			}
+			defer stateMutex.Unlock()
+			
+			// Prepare activity input
+			activityInput := activities.ProcessEventActivityInput[TEvent]{
+				EntityType:     entityType,
+				SequenceNumber: sequenceNumber,
+				EventEnvelope:  envelope,
+				CurrentState:   currentStateBytes,
+				CreatedAt:      createdAt,
+			}
+			
+			// Configure local activity options
+			localActivityOptions := workflow.LocalActivityOptions{
+				ScheduleToCloseTimeout: 30 * time.Second, // Engine processing should be fast
+				RetryPolicy: &temporal.RetryPolicy{
+					InitialInterval:    100 * time.Millisecond,
+					BackoffCoefficient: 1.5,
+					MaximumInterval:    5 * time.Second,
+					MaximumAttempts:    3, // Limited retries for engine failures
+					NonRetryableErrorTypes: []string{
+						"ValidationError",
+						"BusinessRuleViolation",
+					},
+				},
+			}
+			
+			ctx = workflow.WithLocalActivityOptions(ctx, localActivityOptions)
+			
+			// Execute blocking local activity
+			var activityResult activities.ProcessEventActivityResult
+			err = workflow.ExecuteLocalActivity(ctx, activities.ProcessEventActivity[TState, TEvent, TTransitionInfo], activityInput).Get(ctx, &activityResult)
+			if err != nil {
+				logger.Error("❌ Engine activity execution failed", "error", err)
+				return zero, fmt.Errorf("engine activity failed: %w", err)
+			}
+			
+			// Handle engine processing failure
+			if !activityResult.Success {
+				logger.Error("❌ Engine processing failed", "error", activityResult.ErrorMessage)
+				return zero, fmt.Errorf("engine processing failed: %s", activityResult.ErrorMessage)
+			}
+			
+			// ✅ CRITICAL: Verify sequence number consistency
+			if activityResult.SequenceNumber != sequenceNumber {
+				logger.Error("❌ Sequence number mismatch - potential state corruption",
+					"expected", sequenceNumber,
+					"received", activityResult.SequenceNumber)
+				return zero, fmt.Errorf("sequence number mismatch: expected %d, got %d", 
+					sequenceNumber, activityResult.SequenceNumber)
+			}
+			
+			// Deserialize new state from activity result
+			var newState TState
+			newState = utils.NewInstance[TState]()
+			if err := proto.Unmarshal(activityResult.NewState, newState); err != nil {
+				logger.Error("❌ Failed to deserialize new state from activity", "error", err)
+				return zero, fmt.Errorf("failed to deserialize new state: %w", err)
+			}
+			
+			// Deserialize transition info from activity result
+			var transitionInfo TTransitionInfo
+			transitionInfo = utils.NewInstance[TTransitionInfo]()
+			if err := proto.Unmarshal(activityResult.TransitionInfo, transitionInfo); err != nil {
+				logger.Error("❌ Failed to deserialize transition info from activity", "error", err)
+				return zero, fmt.Errorf("failed to deserialize transition info: %w", err)
 			}
 
 			// Update current state

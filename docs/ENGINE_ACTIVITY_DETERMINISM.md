@@ -287,7 +287,7 @@ LocalActivityOptions{
 
 ## Testing Strategy
 
-### **Unit Tests:**
+### **Unit Tests for Activities:**
 ```go
 func TestProcessEventActivity_Success(t *testing.T) {
     input := ProcessEventActivityInput{
@@ -305,23 +305,115 @@ func TestProcessEventActivity_Success(t *testing.T) {
 }
 ```
 
-### **Integration Tests:**
+### **Integration Tests - PREFER REAL LOCAL ACTIVITIES:**
+
 ```go
-func TestWorkflow_WithEngineActivity(t *testing.T) {
-    // Test full workflow with mocked engine activity
+// ✅ PREFERRED - Use real local activities for most tests
+func TestWorkflow_WithRealLocalActivity(t *testing.T) {
     env := suite.NewTestWorkflowEnvironment()
     
-    // Mock the activity
-    env.OnActivity(ProcessEventActivity, mock.Anything).Return(&ProcessEventActivityResult{
-        Success: true,
-        SequenceNumber: 1,
-        NewState: expectedState,
-    }, nil)
+    // Register REAL activity - no mocking needed!
+    env.RegisterActivity(ProcessEventActivity)
     
-    // Test workflow execution
-    env.ExecuteWorkflow(EntityWorkflow, params, engine, idHandler)
+    // Test with real engine processing
+    demoEngine := demo.NewDemoEngine()
+    env.ExecuteWorkflow(EntityWorkflow, testParams, demoEngine, idHandler)
     
     assert.True(t, env.IsWorkflowCompleted())
+    
+    // Verify actual state transitions - tests real engine logic
+    var finalState *demov1.DemoEntityState
+    env.GetWorkflowResult(&finalState)
+    assert.Equal(t, expectedRealState, finalState)
+}
+
+// ✅ Mock only for specific error scenarios
+func TestWorkflow_ActivityTimeoutHandling(t *testing.T) {
+    env := suite.NewTestWorkflowEnvironment()
+    
+    // Mock ONLY to simulate timeout failures
+    env.OnActivity(ProcessEventActivity, mock.Anything).Return(
+        nil, temporal.NewTimeoutError(enumspb.TIMEOUT_TYPE_SCHEDULE_TO_CLOSE))
+    
+    env.ExecuteWorkflow(EntityWorkflow, testParams, engine, idHandler)
+    
+    // Verify timeout error handling
+    assert.True(t, env.IsWorkflowCompleted())
+    assert.Error(t, env.GetWorkflowError())
+}
+
+func TestWorkflow_SequenceNumberMismatch(t *testing.T) {
+    env := suite.NewTestWorkflowEnvironment()
+    
+    // Mock to simulate sequence number corruption
+    env.OnActivity(ProcessEventActivity, mock.Anything).Return(
+        &ProcessEventActivityResult{
+            Success: true,
+            SequenceNumber: 999, // Wrong sequence number
+            NewState: someState,
+        }, nil)
+    
+    env.ExecuteWorkflow(EntityWorkflow, testParams, engine, idHandler)
+    
+    // Verify sequence mismatch detection
+    assert.Error(t, env.GetWorkflowError())
+    assert.Contains(t, env.GetWorkflowError().Error(), "sequence number mismatch")
+}
+
+func TestWorkflow_EngineProcessingFailure(t *testing.T) {
+    env := suite.NewTestWorkflowEnvironment()
+    
+    // Mock to simulate engine processing failures
+    env.OnActivity(ProcessEventActivity, mock.Anything).Return(
+        &ProcessEventActivityResult{
+            Success: false,
+            ErrorMessage: "simulated engine failure",
+            SequenceNumber: 1,
+        }, nil)
+    
+    env.ExecuteWorkflow(EntityWorkflow, testParams, engine, idHandler)
+    
+    // Verify engine failure handling
+    assert.Error(t, env.GetWorkflowError())
+    assert.Contains(t, env.GetWorkflowError().Error(), "engine processing failed")
+}
+```
+
+### **Why Real Local Activities are Better:**
+
+1. **Fast Execution**: Local activities run in-process, so tests are still fast
+2. **Real Engine Logic**: Test actual business logic, not mocked behavior
+3. **Full Integration**: Catch real issues between workflow and engine
+4. **Deterministic**: Engine logic should be deterministic anyway
+5. **Simpler Tests**: No complex mocking setup for happy path
+6. **Better Coverage**: Tests reflect actual production behavior
+
+### **When to Mock Local Activities:**
+
+- **Timeout testing**: Simulate activity timeouts
+- **Engine failures**: Test specific error conditions
+- **Sequence corruption**: Test state consistency validation
+- **Performance testing**: Control timing for race condition tests
+
+### **Test Categories:**
+
+```go
+// 1. Happy Path - Real Activities
+func TestWorkflow_SuccessfulEventProcessing(t *testing.T) {
+    // Use real activities, real engines
+    // Test actual state transitions
+}
+
+// 2. Error Handling - Mocked Failures  
+func TestWorkflow_ErrorScenarios(t *testing.T) {
+    // Mock specific failures
+    // Test error handling logic
+}
+
+// 3. Edge Cases - Mixed Approach
+func TestWorkflow_EdgeCases(t *testing.T) {
+    // Real activities for setup
+    // Mocked failures for specific edge cases
 }
 ```
 

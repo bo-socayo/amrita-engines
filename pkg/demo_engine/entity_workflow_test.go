@@ -9,7 +9,9 @@ import (
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
+	"github.com/bo-socayo/amrita-engines/pkg/engines"
 	"github.com/bo-socayo/amrita-engines/pkg/entityworkflows"
+	"github.com/bo-socayo/amrita-engines/pkg/entityworkflows/activities"
 	basev1 "github.com/bo-socayo/amrita-engines/gen/engines/base/v1"
 	demov1 "github.com/bo-socayo/amrita-engines/gen/engines/demo/v1"
 )
@@ -25,6 +27,28 @@ func (s *DemoEntityWorkflowTestSuite) SetupTest() {
 	
 	// Register the entity workflow
 	s.env.RegisterWorkflow(DemoEntityWorkflow)
+	
+	// ✅ Register the ProcessEventActivity for deterministic engine processing
+	s.env.RegisterActivity(activities.ProcessEventActivity[*demov1.DemoEngineState, *demov1.DemoEngineSignal, *demov1.DemoEngineTransitionInfo])
+	
+	// ✅ Register demo engine factory for activity execution
+	activities.RegisterEngine[*demov1.DemoEngineState, *demov1.DemoEngineSignal, *demov1.DemoEngineTransitionInfo](
+		"demo.Engine",
+		func() engines.Engine[*demov1.DemoEngineState, *demov1.DemoEngineSignal, *demov1.DemoEngineTransitionInfo] {
+			// Create demo engine with the same configuration as used in DemoEntityWorkflow
+			config := engines.BaseEngineConfig[*demov1.DemoEngineState, *demov1.DemoEngineSignal, *demov1.DemoEngineTransitionInfo]{
+				EngineName:           EngineName,
+				BusinessLogicVersion: BusinessLogicVersion,
+				StateTypeName:        "DemoEngineState",
+				EventTypeName:        "DemoEngineSignal",
+				TransitionTypeName:   "DemoEngineTransitionInfo",
+				Processor:            ProcessSignal,
+				Defaults:             ApplyBusinessDefaults,
+				Compress:             CompressState,
+			}
+			return engines.NewBaseEngine(config)
+		},
+	)
 }
 
 func (s *DemoEntityWorkflowTestSuite) TearDownTest() {
