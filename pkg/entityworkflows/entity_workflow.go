@@ -346,7 +346,7 @@ func EntityWorkflow[TState, TEvent, TTransitionInfo proto.Message](
 	})
 
 	// ✅ Register update handler with proper authorization and RequestContext
-	workflow.SetUpdateHandlerWithOptions(ctx, "processEvent", 
+	err = workflow.SetUpdateHandlerWithOptions(ctx, "processEvent", 
 		func(ctx workflow.Context, requestCtx *entityv1.RequestContext, event TEvent) (TState, error) {
 			logger := workflow.GetLogger(ctx)
 			logger.Info("📨 ProcessEvent handler called")
@@ -480,6 +480,12 @@ func EntityWorkflow[TState, TEvent, TTransitionInfo proto.Message](
 				return nil
 			},
 		})
+	
+	if err != nil {
+		logger.Error("❌ Failed to register processEvent update handler", "error", err)
+		return fmt.Errorf("failed to register update handler: %w", err)
+	}
+	logger.Info("✅ processEvent update handler registered successfully")
 
 	// ✅ Removed batch processing for simplicity
 
