@@ -279,7 +279,7 @@ func EntityWorkflow[TState, TEvent, TTransitionInfo proto.Message](
 	logger.Info("🎯 Workflow state updated and marked as initialized")
 
 	// ✅ Workflow mutex for state protection
-	var stateMutex workflow.Mutex
+	stateMutex := workflow.NewMutex(ctx)
 
 	// Register query handler to return full engine state
 	workflow.SetQueryHandler(ctx, "getEntityState", func() (*EntityQueryResponse[TState], error) {
