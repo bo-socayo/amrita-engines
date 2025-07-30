@@ -473,7 +473,7 @@ func EntityWorkflow[TState, TEvent, TTransitionInfo proto.Message](
 		},
 		workflow.UpdateHandlerOptions{
 			// ✅ Validator prevents updates during continue-as-new
-			Validator: func(ctx workflow.Context, event TEvent) error {
+			Validator: func(ctx workflow.Context, requestCtx *entityv1.RequestContext, event TEvent) error {
 				if workflowState.requestCount >= workflowState.requestsBeforeCAN {
 					return temporal.NewApplicationError("Backoff for continue-as-new", "ErrBackoff")
 				}
