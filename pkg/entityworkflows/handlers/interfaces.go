@@ -13,13 +13,11 @@ type QueryHandler[TState proto.Message] interface {
 
 // UpdateHandler defines the interface for handling workflow updates
 type UpdateHandler[TState, TEvent proto.Message] interface {
-	HandleProcessEvent(
+	ProcessEvent(
 		ctx workflow.Context,
-		requestCtx *entityv1.RequestContext,
 		event TEvent,
-		initialized bool,
-		currentState TState,
-	) (TState, error)
+		sequenceNumber int64,
+	) (TState, interface{}, error)
 }
 
 // UpdateValidator defines the interface for validating updates

@@ -292,4 +292,102 @@ func TestIdempotencyChecker_GetCutoffForContinuation(t *testing.T) {
 
 	result = checker.GetCutoffForContinuation(mockCtx)
 	assert.Equal(t, time2, result)
+}
+
+// === Additional coverage tests ===
+
+func TestWorkflowState_ShouldContinueAsNew_AdditionalCoverage(t *testing.T) {
+	cutoff := time.Now().Add(-1 * time.Hour)
+	state := NewWorkflowState(cutoff)
+	mockCtx := NewMockWorkflowContext()
+	
+	// Test the core logic using the testable interface (already tested above, but ensuring coverage)
+	// Should not continue when request count is below threshold (threshold is 1000)
+	for i := 0; i < 900; i++ {
+		state.IncrementRequestCount()
+	}
+	assert.False(t, state.ShouldContinueAsNew(mockCtx))
+	
+	// Should continue when request count reaches threshold
+	for i := 0; i < 200; i++ {
+		state.IncrementRequestCount()
+	}
+	assert.True(t, state.ShouldContinueAsNew(mockCtx))
+	
+	// Test with Temporal suggestion
+	state2 := NewWorkflowState(cutoff)
+	mockCtx.SetContinueAsNewSuggested(true)
+	assert.True(t, state2.ShouldContinueAsNew(mockCtx))
+	
+	// Test that pending updates don't affect ShouldContinueAsNew (that logic is in the main workflow)
+	state3 := NewWorkflowState(cutoff)
+	for i := 0; i < 1100; i++ {
+		state3.IncrementRequestCount()
+	}
+	state3.IncrementPendingUpdates()
+	// ShouldContinueAsNew only checks request count and Temporal suggestion, not pending updates
+	assert.True(t, state3.ShouldContinueAsNew(mockCtx))
+}
+
+// === Edge case tests for better coverage ===
+
+func TestWorkflowState_EntityMetadata_EdgeCases(t *testing.T) {
+	cutoff := time.Now().Add(-1 * time.Hour)
+	state := NewWorkflowState(cutoff)
+	
+	// Test with nil metadata
+	assert.Nil(t, state.GetEntityMetadata())
+	
+	// Test setting and getting metadata
+	metadata := &entityv1.EntityMetadata{
+		EntityId: "test-entity",
+		OrgId:    "test-org",
+	}
+	state.SetEntityMetadata(metadata)
+	assert.Equal(t, metadata, state.GetEntityMetadata())
+}
+
+func TestWorkflowState_PendingUpdates_EdgeCases(t *testing.T) {
+	cutoff := time.Now().Add(-1 * time.Hour)
+	state := NewWorkflowState(cutoff)
+	
+	// Test initial state
+	assert.Equal(t, 0, state.GetPendingUpdates())
+	
+	// Test increment/decrement cycle
+	state.IncrementPendingUpdates()
+	assert.Equal(t, 1, state.GetPendingUpdates())
+	
+	state.IncrementPendingUpdates()
+	assert.Equal(t, 2, state.GetPendingUpdates())
+	
+	state.DecrementPendingUpdates()
+	assert.Equal(t, 1, state.GetPendingUpdates())
+	
+	state.DecrementPendingUpdates()
+	assert.Equal(t, 0, state.GetPendingUpdates())
+}
+
+func TestWorkflowState_RequestsBeforeCAN_EdgeCases(t *testing.T) {
+	cutoff := time.Now().Add(-1 * time.Hour)
+	state := NewWorkflowState(cutoff)
+	
+	// Test default value (checking actual implementation)
+	assert.Equal(t, 1000, state.GetRequestsBeforeCAN())
+}
+
+func TestIdempotencyChecker_EdgeCases(t *testing.T) {
+	cutoff := time.Now().Add(-1 * time.Hour)
+	checker := NewIdempotencyChecker(cutoff)
+	mockCtx := NewMockWorkflowContext()
+	
+	// Test with zero time request (before cutoff, should return true - treated as already processed)
+	zeroTime := time.Time{}
+	assert.True(t, checker.IsRequestProcessed(mockCtx, "test-key", zeroTime))
+	
+	// Test GetCutoff
+	assert.Equal(t, cutoff, checker.GetCutoff())
+	
+	// Test with exactly cutoff time (at cutoff, should return true - treated as already processed)
+	assert.True(t, checker.IsRequestProcessed(mockCtx, "test-key", cutoff))
 } 

@@ -14,7 +14,6 @@ import (
 	entityv1 "github.com/bo-socayo/amrita-engines/gen/entity/v1"
 	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/workflow"
-	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
@@ -119,69 +118,34 @@ func EntityWorkflow[TState, TEvent, TTransitionInfo proto.Message](
 	// ✅ Workflow mutex for state protection
 	stateMutex := workflow.NewMutex(ctx)
 
-	// Register query handler to return full engine state
-	workflow.SetQueryHandler(ctx, "getEntityState", func() (*EntityQueryResponse[TState], error) {
+	// ✅ Create query handler instance and register it
+	queryHandler := handlers.NewEntityQueryHandler[TState]()
+	workflow.SetQueryHandler(ctx, "getEntityState", func() (*handlers.EntityQueryResponse[TState], error) {
 		logger.Info("🔍 Query handler called", "initialized", initialized, "currentStateNil", reflect.ValueOf(currentState).IsNil())
 		
-		if !initialized {
-			logger.Info("❌ Workflow not initialized, returning zero state")
-			var zeroState TState
-			// Serialize zero state to JSON using protojson
-			stateJSON, err := protojson.Marshal(zeroState)
-			if err != nil {
-				logger.Error("❌ Failed to marshal zero state to JSON", "error", err)
-				return nil, fmt.Errorf("failed to marshal zero state to JSON: %w", err)
-			}
-			logger.Info("✅ Zero state marshaled", "jsonLength", len(stateJSON))
-			return &EntityQueryResponse[TState]{
-				CurrentStateJSON: string(stateJSON),
-				Metadata:         entityMetadata, // May be nil if no requests received yet
-				IsInitialized:    false,
-			}, nil
-		}
-
-		// Serialize current state to JSON using protojson to handle oneof fields properly
-		currentStateValue := reflect.ValueOf(currentState)
-		logger.Info("🔍 Attempting to marshal current state to JSON", 
-			"stateType", reflect.TypeOf(currentState).String(),
-			"stateIsNil", currentStateValue.IsNil(),
-			"stateValue", fmt.Sprintf("%+v", currentState))
-		
-		if currentStateValue.IsNil() {
-			logger.Error("❌ Current state is nil even though initialized=true")
-			return nil, fmt.Errorf("current state is nil")
+		var entityId string
+		if entityMetadata != nil {
+			entityId = entityMetadata.EntityId
+		} else {
+			entityId = params.EntityId
 		}
 		
-		stateJSON, err := protojson.Marshal(currentState)
+		response, err := queryHandler.HandleGetEntityState(initialized, currentState, entityMetadata, entityId)
 		if err != nil {
-			logger.Error("❌ Failed to marshal state to JSON", "error", err)
-			return nil, fmt.Errorf("failed to marshal current state to JSON: %w", err)
+			logger.Error("❌ Query handler failed", "error", err)
+			return nil, err
 		}
 		
-					logger.Info("✅ Successfully marshaled state to JSON", 
-				"jsonLength", len(stateJSON), 
-				"isEmpty", len(stateJSON) == 0,
-				"preview", string(stateJSON)[:min(len(stateJSON), 200)])
-
-			response := &EntityQueryResponse[TState]{
-				CurrentStateJSON: string(stateJSON),
-				Metadata:         entityMetadata,
-				IsInitialized:    true,
-			}
-			
-			var entityId string
-			if entityMetadata != nil {
-				entityId = entityMetadata.EntityId
-			} else {
-				entityId = params.EntityId
-			}
-			
-			logger.Info("🎯 Returning query response", 
-				"responseJSONLength", len(response.CurrentStateJSON),
-				"metadataEntityId", entityId)
+		logger.Info("🎯 Returning query response", 
+			"responseJSONLength", len(response.CurrentStateJSON),
+			"metadataEntityId", entityId,
+			"isInitialized", response.IsInitialized)
 		
 		return response, nil
 	})
+
+	// ✅ Create update handler instance
+	updateHandler := handlers.NewEntityUpdateHandler[TState, TEvent, TTransitionInfo](engine, entityType)
 
 	// ✅ Register update handler with proper authorization and RequestContext
 	err = workflow.SetUpdateHandlerWithOptions(ctx, "processEvent", 
@@ -273,31 +237,14 @@ func EntityWorkflow[TState, TEvent, TTransitionInfo proto.Message](
 			// ✅ Increment internal sequence number for this event (preserved across continue-as-new)
 			sequenceNumber := workflowState.IncrementSequenceNumber()
 			
-			logger.Info("📦 Creating typed event envelope", "sequenceNumber", sequenceNumber)
-			// Create typed event envelope (passing nil for metadata for now)
-			envelope, err := engines.NewTypedEventEnvelope(
-				sequenceNumber,
-				fmt.Sprintf("%s.event", entityType),
-				timestamppb.New(workflow.Now(ctx)),
-				event,
-				nil, // TODO: Convert map[string]string metadata to protobuf
-			)
+			// ✅ Use extracted update handler for core event processing
+			newState, transitionInfo, err := updateHandler.ProcessEvent(ctx, event, sequenceNumber)
 			if err != nil {
-				logger.Error("❌ Failed to create event envelope", "error", err)
-				return zero, fmt.Errorf("failed to create event envelope: %w", err)
-			}
-
-			logger.Info("⚙️  Processing event through engine")
-			// Process event through engine - IDIOMATIC GO: returns (state, transitionInfo, error)
-			engineCtx := context.Background()
-			newState, transitionInfo, err := engine.ProcessEvent(engineCtx, envelope)
-			if err != nil {
-				logger.Error("❌ Engine ProcessEvent failed", "error", err)
+				logger.Error("❌ Update handler failed", "error", err)
 				return zero, fmt.Errorf("failed to process event: %w", err)
 			}
 
-			logger.Info("📊 Processing completed successfully")
-			// Update current state - no unmarshaling needed, we get the typed state directly
+			// Update current state
 			currentState = newState
 			
 			// ✅ Mark request as processed for idempotency (if we have request context)
@@ -329,8 +276,6 @@ func EntityWorkflow[TState, TEvent, TTransitionInfo proto.Message](
 		return fmt.Errorf("failed to register update handler: %w", err)
 	}
 	logger.Info("✅ processEvent update handler registered successfully")
-
-	// ✅ Removed batch processing for simplicity
 
 	// ✅ Main workflow loop with proper continue-as-new logic
 	for {
